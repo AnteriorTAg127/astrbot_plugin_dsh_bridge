@@ -27,6 +27,7 @@ from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.star import Context, Star
 from astrbot.api.web import error_response, json_response, request
+from astrbot.core.agent.tool import FunctionTool
 from astrbot.core.utils.astrbot_path import get_astrbot_plugin_data_path
 
 from .bridge.app.approvals import ApprovalService
@@ -312,166 +313,179 @@ class DshBridgePlugin(Star):
 
     async def initialize(self) -> None:
         """Create the data directory, open the store and start background work."""
-        self._data_dir = Path(get_astrbot_plugin_data_path()) / PLUGIN_NAME
-        (self._data_dir / "tmp").mkdir(parents=True, exist_ok=True)
+        try:
+            self._data_dir = Path(get_astrbot_plugin_data_path()) / PLUGIN_NAME
+            (self._data_dir / "tmp").mkdir(parents=True, exist_ok=True)
 
-        self._store = Store()
-        await self._store.init(self._data_dir / "bridge.db")
-        await self._store.cleanup_expired(
-            _int(self._cfg("task_retention_days", 7), 7, minimum=1)
-        )
+            self._store = Store()
+            await self._store.init(self._data_dir / "bridge.db")
+            await self._store.cleanup_expired(
+                _int(self._cfg("task_retention_days", 7), 7, minimum=1)
+            )
 
-        conn = self._primary()
-        self._blobs = BlobService(
-            tmp_dir=self._data_dir / "tmp",
-            image_enabled=_bool(self._cfg("image_enabled", True), True),
-            max_bytes=_int(
-                self._cfg("image_max_bytes", 10_485_760), 10_485_760, minimum=1024
-            ),
-            max_count=_int(self._cfg("image_max_count", 4), 4, minimum=1, maximum=64),
-            total_max_bytes=_int(
-                self._cfg("image_total_max_bytes", 20_971_520),
-                20_971_520,
-                minimum=1024,
-            ),
-            allowed_mime=tuple(
-                _list(self._cfg("image_allowed_mime", None), list(IMAGE_MIME_TYPES))
-            ),
-        )
-        await self._blobs.init()
+            conn = self._primary()
+            self._blobs = BlobService(
+                tmp_dir=self._data_dir / "tmp",
+                image_enabled=_bool(self._cfg("image_enabled", True), True),
+                max_bytes=_int(
+                    self._cfg("image_max_bytes", 10_485_760), 10_485_760, minimum=1024
+                ),
+                max_count=_int(
+                    self._cfg("image_max_count", 4), 4, minimum=1, maximum=64
+                ),
+                total_max_bytes=_int(
+                    self._cfg("image_total_max_bytes", 20_971_520),
+                    20_971_520,
+                    minimum=1024,
+                ),
+                allowed_mime=tuple(
+                    _list(self._cfg("image_allowed_mime", None), list(IMAGE_MIME_TYPES))
+                ),
+            )
+            await self._blobs.init()
 
-        self._sessions_svc = SessionService(
-            self._store,
-            conn=self._conn_id(),
-            allow_agent_create=conn["allow_agent_create"] if conn else True,
-            max_agent_sessions=conn["max_agent_sessions"] if conn else 10,
-            on_authz_changed=self._push_authz,
-        )
-        await self._sessions_svc.init()
+            self._sessions_svc = SessionService(
+                self._store,
+                conn=self._conn_id(),
+                allow_agent_create=conn["allow_agent_create"] if conn else True,
+                max_agent_sessions=conn["max_agent_sessions"] if conn else 10,
+                on_authz_changed=self._push_authz,
+            )
+            await self._sessions_svc.init()
 
-        self._notify = NotifyService(
-            self._store,
-            conn=self._conn_id(),
-            wake_max_chain=_int(
-                self._cfg("wake_max_chain", DEFAULT_WAKE_MAX_CHAIN),
-                DEFAULT_WAKE_MAX_CHAIN,
-                minimum=1,
-            ),
-            wake_rate_per_minute=_int(
-                self._cfg("wake_rate_per_minute", DEFAULT_WAKE_RATE_PER_MINUTE),
-                DEFAULT_WAKE_RATE_PER_MINUTE,
-                minimum=1,
-            ),
-            on_task_event=self._send_task_event,
-            on_event=self._send_event_message,
-            on_ack_request=self._send_ack_request,
-        )
+            self._notify = NotifyService(
+                self._store,
+                conn=self._conn_id(),
+                wake_max_chain=_int(
+                    self._cfg("wake_max_chain", DEFAULT_WAKE_MAX_CHAIN),
+                    DEFAULT_WAKE_MAX_CHAIN,
+                    minimum=1,
+                ),
+                wake_rate_per_minute=_int(
+                    self._cfg("wake_rate_per_minute", DEFAULT_WAKE_RATE_PER_MINUTE),
+                    DEFAULT_WAKE_RATE_PER_MINUTE,
+                    minimum=1,
+                ),
+                on_task_event=self._send_task_event,
+                on_event=self._send_event_message,
+                on_ack_request=self._send_ack_request,
+            )
 
-        self._platform = PlatformHost(self.context)
-        self._capabilities = HostCapabilities(
-            version="0.1.0",
-            transports=["longpoll", "webhook", "ws"],
-            tls=bool(conn["tls"]) if conn else False,
-            image_enabled=_bool(self._cfg("image_enabled", True), True),
-            image_max_count=_int(self._cfg("image_max_count", 4), 4, minimum=1),
-            image_max_bytes=_int(
-                self._cfg("image_max_bytes", 10_485_760), 10_485_760, minimum=1024
-            ),
-            image_total_max_bytes=_int(
-                self._cfg("image_total_max_bytes", 20_971_520), 20_971_520, minimum=1024
-            ),
-        )
+            self._platform = PlatformHost(self.context)
+            self._capabilities = HostCapabilities(
+                version="0.1.0",
+                transports=["longpoll", "webhook", "ws"],
+                tls=bool(conn["tls"]) if conn else False,
+                image_enabled=_bool(self._cfg("image_enabled", True), True),
+                image_max_count=_int(self._cfg("image_max_count", 4), 4, minimum=1),
+                image_max_bytes=_int(
+                    self._cfg("image_max_bytes", 10_485_760), 10_485_760, minimum=1024
+                ),
+                image_total_max_bytes=_int(
+                    self._cfg("image_total_max_bytes", 20_971_520),
+                    20_971_520,
+                    minimum=1024,
+                ),
+            )
 
-        self._openapi = OpenApiHost(
-            base_url=_str(
-                self._cfg("openapi_base_url", "http://127.0.0.1:6185"),
-                "http://127.0.0.1:6185",
-            ),
-            api_key=_str(self._cfg("openapi_api_key", ""), ""),
-            key_id=_str(self._cfg("openapi_key_id", ""), ""),
-            allow_private_addr=_bool(self._cfg("addr_allow_private", False), False),
-        )
+            self._openapi = OpenApiHost(
+                base_url=_str(
+                    self._cfg("openapi_base_url", "http://127.0.0.1:6185"),
+                    "http://127.0.0.1:6185",
+                ),
+                api_key=_str(self._cfg("openapi_api_key", ""), ""),
+                key_id=_str(self._cfg("openapi_key_id", ""), ""),
+                allow_private_addr=_bool(self._cfg("addr_allow_private", False), False),
+            )
 
-        self._approvals = ApprovalService(
-            self._store,
-            conn=self._conn_id(),
-            side="A",
-            approval_timeout_s=_int(
-                self._cfg("approval_timeout_seconds", 1800), 1800, minimum=30
-            ),
-            notify_channels=_list(
-                self._cfg("approval_notify_channels", None), ["im", "web"]
-            ),
-            notify=self._notify,
-            on_approval_decided=self._on_approval_decided,
-            on_decision_answered=self._on_decision_answered,
-            on_human_notify=self._on_human_notify,
-            blobs=self._blobs,
-            # Fail closed until a handshake proves the peer side: ``native_tool``
-            # requests are refused while this anchor is not a protocol side.
-            peer_side=UNVERIFIED_PEER_SIDE,
-            native_tool_origin="B",
-        )
+            self._approvals = ApprovalService(
+                self._store,
+                conn=self._conn_id(),
+                side="A",
+                approval_timeout_s=_int(
+                    self._cfg("approval_timeout_seconds", 1800), 1800, minimum=30
+                ),
+                notify_channels=_list(
+                    self._cfg("approval_notify_channels", None), ["im", "web"]
+                ),
+                notify=self._notify,
+                on_approval_decided=self._on_approval_decided,
+                on_decision_answered=self._on_decision_answered,
+                on_human_notify=self._on_human_notify,
+                blobs=self._blobs,
+                # Fail closed until a handshake proves the peer side: ``native_tool``
+                # requests are refused while this anchor is not a protocol side.
+                peer_side=UNVERIFIED_PEER_SIDE,
+                native_tool_origin="B",
+            )
 
-        self._tasks = TaskService(
-            self._store,
-            conn=self._conn_id(),
-            notify=self._notify,
-            sessions=self._sessions_svc,
-            host=self._host_runner(),
-            approvals=self._approvals,
-            image_enabled=_bool(self._cfg("image_enabled", True), True),
-            on_state_change=self._on_task_state_change,
-        )
-        # Releasing a held outbound submission must use the session that is live
-        # at that moment; a stale/absent link parks the task instead of sending.
-        self._tasks.set_session_provider(lambda: self._session)
+            self._tasks = TaskService(
+                self._store,
+                conn=self._conn_id(),
+                notify=self._notify,
+                sessions=self._sessions_svc,
+                host=self._host_runner(),
+                approvals=self._approvals,
+                image_enabled=_bool(self._cfg("image_enabled", True), True),
+                on_state_change=self._on_task_state_change,
+            )
+            # Releasing a held outbound submission must use the session that is live
+            # at that moment; a stale/absent link parks the task instead of sending.
+            self._tasks.set_session_provider(lambda: self._session)
 
-        self._router = Router(self._store, conn=self._conn_id())
-        self._tasks.register(self._router)
-        self._approvals.register(self._router)
-        self._register_session_handlers()
-        self._register_blob_handlers()
-        self._register_notify_handlers()
+            self._router = Router(self._store, conn=self._conn_id())
+            self._tasks.register(self._router)
+            self._approvals.register(self._router)
+            self._register_session_handlers()
+            self._register_blob_handlers()
+            self._register_notify_handlers()
 
-        # OpenAPI identity self-check before any task can run (§16.3 rule 2).
-        if self._openapi.configured():
-            try:
-                await self._openapi.verify_ownership()
-            except BridgeError as exc:
-                logger.error(
-                    "bridge openapi identity check failed code=%s -> tasks disabled",
-                    exc.code,
+            # OpenAPI identity self-check before any task can run (§16.3 rule 2).
+            if self._openapi.configured():
+                try:
+                    await self._openapi.verify_ownership()
+                except BridgeError as exc:
+                    logger.error(
+                        "bridge openapi identity check failed code=%s -> tasks disabled",
+                        exc.code,
+                    )
+                    self._openapi = None
+            else:
+                logger.warning(
+                    "bridge openapi not configured: inbound task execution is disabled"
                 )
-                self._openapi = None
-        else:
-            logger.warning(
-                "bridge openapi not configured: inbound task execution is disabled"
-            )
 
-        await self._tasks.recover_after_restart()
-        # Pending native tool approvals are peer-process-local promises: after a
-        # restart the DSH run that asked is gone, so the only honest terminal state
-        # is ``unavailable`` (never a silent grant, never a re-prompt) — §12.4.
-        await self._approvals.invalidate_native_pending("restart")
+            await self._tasks.recover_after_restart()
+            # Pending native tool approvals are peer-process-local promises: after a
+            # restart the DSH run that asked is gone, so the only honest terminal state
+            # is ``unavailable`` (never a silent grant, never a re-prompt) — §12.4.
+            await self._approvals.invalidate_native_pending("restart")
 
-        self._notify.start()
-        self._background.append(asyncio.create_task(self._approvals.timeout_loop()))
-        self._background.append(asyncio.create_task(self._blobs.cleanup_loop()))
-        self._background.append(asyncio.create_task(self._maintenance_loop()))
+            self._notify.start()
+            self._background.append(asyncio.create_task(self._approvals.timeout_loop()))
+            self._background.append(asyncio.create_task(self._blobs.cleanup_loop()))
+            self._background.append(asyncio.create_task(self._maintenance_loop()))
 
-        if _bool(self._cfg("dashboard_enabled", True), True):
-            self._register_web_apis()
-        self._register_llm_tools()
+            if _bool(self._cfg("dashboard_enabled", True), True):
+                self._register_web_apis()
+            self._register_llm_tools()
 
-        if conn is not None:
-            self._background.append(asyncio.create_task(self._run_connection(conn)))
-        else:
-            logger.warning(
-                "bridge no connection configured: add one in the plugin settings"
-            )
-        self._started = True
-        logger.info("bridge plugin initialised data_dir=%s", self._data_dir)
+            if conn is not None:
+                self._background.append(asyncio.create_task(self._run_connection(conn)))
+            else:
+                logger.warning(
+                    "bridge no connection configured: add one in the plugin settings"
+                )
+            self._started = True
+            logger.info("bridge plugin initialised data_dir=%s", self._data_dir)
+
+        except BaseException:
+            # The host clears the plugin registry on a failed load without calling
+            # terminate(); release whatever this initialize opened, then re-raise the
+            # original exception (including cancellation) unchanged.
+            with contextlib.suppress(BaseException):
+                await self.terminate()
+            raise
 
     def _host_runner(self) -> Any:
         """Return the object used by the task service to execute inbound tasks.
@@ -576,6 +590,10 @@ class DshBridgePlugin(Star):
     async def terminate(self) -> None:
         """Cancel background work and close every resource (no leaks, no races)."""
         self._started = False
+        # Reset the registration guard so the same instance can initialize again; the
+        # host removes the rows by module path on unload, and add_llm_tools replaces
+        # them by name when this instance re-registers.
+        self._llm_tools_registered = False
         for task in list(self._background):
             task.cancel()
         for task in list(self._background):
@@ -2280,7 +2298,32 @@ class DshBridgePlugin(Star):
         return json_response({"session_id": session_id, "authz_version": version})
 
 
-class DshSubmitTaskTool:
+class _DshLlmTool(FunctionTool):
+    """Base adapter for the five ``dsh_*`` LLM tools.
+
+    A plugin tool must be a concrete ``FunctionTool``: the host's permission wrapper
+    reads its ``handler`` and the plugin loader rebinds it by module path. The handler
+    stays bound to this tool instance, which owns the plugin, so the class stays in
+    ``main.py`` and host ownership is resolved from that module.
+    """
+
+    def __init__(self, plugin: DshBridgePlugin) -> None:
+        """Bind the tool to the plugin.
+
+        Args:
+            plugin: Owning plugin instance.
+        """
+        # Pydantic's dataclass init resets instance state, so bind ``_plugin`` after it.
+        super().__init__(
+            name=type(self).name,
+            description=type(self).description,
+            parameters=type(self).parameters,
+            handler=self.__call__,
+        )
+        self._plugin = plugin
+
+
+class DshSubmitTaskTool(_DshLlmTool):
     """LLM tool ``dsh_submit_task``: submit a cross-end task and return a handle."""
 
     name = "dsh_submit_task"
@@ -2305,14 +2348,6 @@ class DshSubmitTaskTool:
         "required": ["prompt"],
     }
 
-    def __init__(self, plugin: DshBridgePlugin) -> None:
-        """Bind the tool to the plugin.
-
-        Args:
-            plugin: Owning plugin instance.
-        """
-        self._plugin = plugin
-
     async def __call__(
         self,
         event: AstrMessageEvent,
@@ -2336,7 +2371,7 @@ class DshSubmitTaskTool:
         )
 
 
-class DshTaskStatusTool:
+class DshTaskStatusTool(_DshLlmTool):
     """LLM tool ``dsh_task_status``: idempotent status query."""
 
     name = "dsh_task_status"
@@ -2351,14 +2386,6 @@ class DshTaskStatusTool:
         "required": ["task_id"],
     }
 
-    def __init__(self, plugin: DshBridgePlugin) -> None:
-        """Bind the tool to the plugin.
-
-        Args:
-            plugin: Owning plugin instance.
-        """
-        self._plugin = plugin
-
     async def __call__(self, event: AstrMessageEvent, task_id: str) -> str:
         """Execute the tool.
 
@@ -2372,7 +2399,7 @@ class DshTaskStatusTool:
         return await self._plugin.llm_task_status(event, task_id)
 
 
-class DshListSessionsTool:
+class DshListSessionsTool(_DshLlmTool):
     """LLM tool ``dsh_list_sessions``: list authorized sessions."""
 
     name = "dsh_list_sessions"
@@ -2388,14 +2415,6 @@ class DshListSessionsTool:
         "required": [],
     }
 
-    def __init__(self, plugin: DshBridgePlugin) -> None:
-        """Bind the tool to the plugin.
-
-        Args:
-            plugin: Owning plugin instance.
-        """
-        self._plugin = plugin
-
     async def __call__(self, event: AstrMessageEvent, purpose: str = "") -> str:
         """Execute the tool.
 
@@ -2409,7 +2428,7 @@ class DshListSessionsTool:
         return await self._plugin.llm_list_sessions(event, purpose)
 
 
-class DshCreateSessionTool:
+class DshCreateSessionTool(_DshLlmTool):
     """LLM tool ``dsh_create_session``: create a session inside the granted quota."""
 
     name = "dsh_create_session"
@@ -2432,14 +2451,6 @@ class DshCreateSessionTool:
         "required": ["purpose"],
     }
 
-    def __init__(self, plugin: DshBridgePlugin) -> None:
-        """Bind the tool to the plugin.
-
-        Args:
-            plugin: Owning plugin instance.
-        """
-        self._plugin = plugin
-
     async def __call__(
         self, event: AstrMessageEvent, purpose: str, title: str = ""
     ) -> str:
@@ -2456,7 +2467,7 @@ class DshCreateSessionTool:
         return await self._plugin.llm_create_session(event, purpose, title)
 
 
-class DshSelectSessionTool:
+class DshSelectSessionTool(_DshLlmTool):
     """LLM tool ``dsh_select_session``: bind a task to an authorized session."""
 
     name = "dsh_select_session"
@@ -2471,14 +2482,6 @@ class DshSelectSessionTool:
         },
         "required": ["task_id", "session_id"],
     }
-
-    def __init__(self, plugin: DshBridgePlugin) -> None:
-        """Bind the tool to the plugin.
-
-        Args:
-            plugin: Owning plugin instance.
-        """
-        self._plugin = plugin
 
     async def __call__(
         self, event: AstrMessageEvent, task_id: str, session_id: str

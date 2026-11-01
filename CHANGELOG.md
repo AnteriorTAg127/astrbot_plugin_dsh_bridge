@@ -27,12 +27,15 @@
 
 - **业务决策超时结算**：真人答复若晚于 `expires_at`，一律返回 `expired` 且不生效；该 pending 行不再由迟到答复自行改成 `expired`，而是留给唯一的超时扫描落定，超时回调最多触发一次，不会因迟到答复抢先改状态而丢失。
 - **后台开关文案**：`dashboard_enabled` 仅控制后台后端接口注册；关闭后宿主仍会扫描 `views/bridge/` 入口，页面内对应的后端接口请求会 404。README 与 `_conf_schema.json` 已按此校正。
+- **LLM 工具宿主契约（v0.1 热修，不改变版本）**：五个 `dsh_*` 适配器改为真正的 `FunctionTool` 子类，`handler` 指向实例 `__call__`，`handler_module_path` 由宿主 `Context.add_llm_tools` 写入。修复裸类缺少 `handler` 时宿主 `_PermissionGuardedTool`/`PluginManager.load` 触发 `AttributeError` 的问题；保留原有参数、权限/审批与显式 `session_id` 语义。该结论仅在本机 AstrBot 4.29.3 的宿主契约测试中验证，**未在用户报告的 4.29.4 上真实运行验收**，截图只能说明契约一致。
+- **初始化局部失败清理**：`initialize` 在 `Store.init` 之后任一步骤失败（含取消）时先 `await terminate()` 再重抛原异常；清理本身失败不掩盖原异常。`terminate` 保持幂等并重置工具注册标记。没有用户失败日志，不能据此宣称所有间歇性 reload 问题均已解决。
 
 ### 测试
 
 - 金标准向量 §18.6 全部断言、密码学、重放窗口、握手失败分类、路由幂等、传输三件套真实 socket 端到端、任务/通知/审批/会话授权/图片生命周期、宿主身份归属与多模态判定、分层与提权扫描。
 - 新增业务决策迟到答复回归：真实过期行 → 迟到真人答复被拒 → 超时扫描 → 再次扫描，断言仅一次 `timed_out` 回调、零人类 choice 回调，且扫描后状态为 `expired`。
-- **当前快照（2026-11-01）**：A 全量单测 **427 passed**（28.27s）、B **377 passed**（33.63s）、A+B 业务回环 **24 passed**（248.38s）、跨传输 **26 passed**（160.19s）、独立密码学校验 **36/36**；B `tsc -p tsconfig.json --noEmit` exit 0。更早的 394/355、360/348/22 与 295/335、19 PASS / 7 `BLOCKED-IMPL` 记录已经作废，仅存档。真实宿主整机验收仍 `BLOCKED-ENV`。
+- 新增 `tests/test_llm_tool_host_contract.py`：使用真实 `Context.add_llm_tools`、`FunctionToolManager.get_full_tool_set`、`_PermissionGuardedTool`、`FunctionToolExecutor.execute` 覆盖五个工具的参数/事件/显式 session 原样转发、权限拒绝不触达业务方法、重复注册去重、停用保留行后新实例重绑不误归属、真实 `_unbind_plugin` 按模块路径移除、`terminate` 两次、同实例重新 `initialize`、局部失败/取消/清理失败三条异常路径。修复前该文件在真实执行路径稳定复现 `AttributeError: 'DshSubmitTaskTool' object has no attribute 'handler'`。
+- **当前快照（2026-11-02）**：A 全量单测 **442 passed**（31.17s）、B **377 passed**（35.03s）、A+B 业务回环 **24 passed**（254.83s）、跨传输 **26 passed**（165.26s）、独立密码学校验 **36/36**；B `tsc -p tsconfig.json --noEmit` exit 0。更早的 394/355、360/348/22 与 295/335、19 PASS / 7 `BLOCKED-IMPL` 记录已经作废，仅存档。真实宿主整机验收仍 `BLOCKED-ENV`；用户环境 4.29.4 未真实运行验收。
 
 ### 安全
 

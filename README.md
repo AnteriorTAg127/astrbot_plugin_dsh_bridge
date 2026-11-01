@@ -12,7 +12,7 @@
 > 协议主本 `开发/v0.1/protocol.md` 属于**内部开发工作记录，不随公开仓库/交付包发布**；
 > 公开可复核的金标准向量是本仓库 [`tests/fixtures/protocol_vectors_v1.json`](tests/fixtures/protocol_vectors_v1.json)。
 
-**版本状态**：插件 `v0.1.0`（`metadata.yaml` 的 `astrbot_version` 为 `>=4.16,<5`）。对端 DSH 侧插件同为 `0.1.0`，面向 `@deepseek-ai/dsh` **`0.2.1-rc.2`**。本地测试环境为 **AstrBot 4.29.3 / Python 3.12.16**，未在其它 AstrBot 版本上实测。主要功能已实现，但仍有待真实环境验证项（见文末「已知限制与未验证项」）；**当前快照（2026-11-01）**：A 全量单测 **427 passed**、B **377 passed**、A+B 真实 socket 业务回环 **24 passed**、跨传输 **26 passed**、独立密码学校验 **36/36**，B `tsc -p tsconfig.json --noEmit` 通过。**真实 AstrBot 宿主内的整机联调、真实 OpenAPI/SSE 流、真实 IM 平台、真实 LLM 多模态判定与 TLS 均未验证（BLOCKED-ENV）**。部署前请先读文末「测试现状」与「已知限制与未验证项」。用户命令统一写成**单行 PowerShell**；`tests/integration/` 中的跨传输 harness 仅支持 POSIX（依赖 `/proc` 与进程组信号），Windows 原生环境不宣称跑通含 integration 的全量，请改用 WSL 执行（命令仍为单行 PowerShell，见「开发」）。
+**版本状态**：插件 `v0.1.0`（`metadata.yaml` 的 `astrbot_version` 为 `>=4.16,<5`）。对端 DSH 侧插件同为 `0.1.0`，面向 `@deepseek-ai/dsh` **`0.2.1-rc.2`**。本地测试环境为 **AstrBot 4.29.3 / Python 3.12.16**；用户环境报告为 **4.29.4**，本轮未在 4.29.4 上真实运行验收，只有本机 4.29.3 的宿主契约测试与用户截图所示契约一致，不能据此宣称 4.29.4 已通过。其余 AstrBot 版本均未实测。主要功能已实现，但仍有待真实环境验证项（见文末「已知限制与未验证项」）；**当前快照（2026-11-02）**：A 全量单测 **442 passed**、B **377 passed**、A+B 真实 socket 业务回环 **24 passed**、跨传输 **26 passed**、独立密码学校验 **36/36**，B `tsc -p tsconfig.json --noEmit` 通过。**真实 AstrBot 宿主内的整机联调、真实 OpenAPI/SSE 流、真实 IM 平台、真实 LLM 多模态判定与 TLS 均未验证（BLOCKED-ENV）**。部署前请先读文末「测试现状」与「已知限制与未验证项」。用户命令统一写成**单行 PowerShell**；`tests/integration/` 中的跨传输 harness 仅支持 POSIX（依赖 `/proc` 与进程组信号），Windows 原生环境不宣称跑通含 integration 的全量，请改用 WSL 执行（命令仍为单行 PowerShell，见「开发」）。
 
 ## 功能
 
@@ -162,6 +162,8 @@ A 侧已经把「本端监听」与「对端地址」拆成两组字段（`conn_
 | `dsh_create_session` | 在配额内创建会话（自动授权） |
 | `dsh_select_session` | 为任务选择授权会话 |
 
+> 这五个适配器是真正的 `FunctionTool` 子类：`handler` 指向实例的 `__call__`，`handler_module_path` 由宿主的 `Context.add_llm_tools` 在注册时写入。因此它们能通过宿主的 `_PermissionGuardedTool` 权限包装与 `FunctionToolExecutor`；恢复为裸类或仅加 `handler` 属性都会在宿主执行时触发 `AttributeError: ... has no attribute 'handler'`。热修同时覆盖“停用（保留工具行）→启用”、卸载按模块路径移除，以及 `initialize` 局部失败后的资源回收。该结论只在本地 AstrBot **4.29.3** 的宿主契约测试中验证，不代表用户报告的 4.29.4 已完成真实运行验收。
+
 ### 后台状态页
 
 AstrBot 插件详情页 → 打开「bridge」视图。包含四块：
@@ -215,8 +217,9 @@ AstrBot 插件详情页 → 打开「bridge」视图。包含四块：
 - **main 侧接线已完成**：通知渠道过滤、按会话解析 provider、`can_write` 宿主写能力探测、`wake_lock` 唤醒串行化、`bind_peer_caps(session.peer_caps)` 均已在 `main.py` 真实调用，并有装配回归覆盖。仍须注意这些结论来自单测与回环 socket，真实宿主整机装配仍是 `BLOCKED-ENV`。
 - **§12.7 `approval.lookup` 已实现并通过本轮两仓单测与真实 socket 业务回环**：接收端无本地证据时向发起端查询权威证据，查询前后复核会话、持久 `peer_lookup` 镜像并原子消费一次；失败/旧记录/换 sid/查询竞态一律 fail-closed。未知或未协商 `peer_caps` 现在直接拒绝远端查询，不再乐观尝试。真实宿主内的最终稳定验收仍属 `BLOCKED-ENV`。
 - **宿主边界已接线，但真实宿主验收未完成**：宿主适配层与 `main.py` 的接线已由单测、业务回环与跨传输用例覆盖；真实 AstrBot/DSH 进程内的整机验收仍以 `BLOCKED-ENV` 记录，不能据此宣称生产可用。
+- **LLM 工具热修只覆盖已确认缺陷**：已修复五个裸类缺少 `FunctionTool.handler` 导致的宿主执行/重载失败，以及 `initialize` 在 `Store.init` 之后失败时未 `terminate` 的资源泄漏；没有用户失败日志，因此**不能声称所有间歇性 reload 问题都已解决**。宿主契约验证使用本机 AstrBot 4.29.3，用户报告的 4.29.4 未真实运行验收；用户截图只能说明契约一致，不能替代 4.29.4 的运行验收。
 - **原生审批的“先答者胜”未实现**：原始需求要求本地 UI 与远端人类都能作答、先答者胜；B 侧实际采用 claim-or-hand-back（本地或远端二选一），与“先回答者竞争”**不等价**，该需求仍未满足。
-- **类型与验收**：没有独立的类型检查门禁；历史跨端快照里的 19 PASS / 7 `BLOCKED-IMPL` 与更早的 295/335 条数字均已过时，只作存档。当前快照为 A 427 / B 377 / business 24 / cross 26 / crypto 36/36（2026-11-01），B `tsc --noEmit` 通过，真实宿主稳定验收仍 `BLOCKED-ENV`。
+- **类型与验收**：没有独立的类型检查门禁；历史跨端快照里的 19 PASS / 7 `BLOCKED-IMPL` 与更早的 295/335 条数字均已过时，只作存档。当前快照为 A 442 / B 377 / business 24 / cross 26 / crypto 36/36（2026-11-02），B `tsc --noEmit` 通过，真实宿主稳定验收仍 `BLOCKED-ENV`。
 - **降级回退**：`TransportManager.carrier_degraded()` → `_switch_to_fallback()` 已真实接线，回环用例有通过记录；但真实跨机 Webhook 探测失败后的回退仍未在真实网络验证，不能据此宣称生产可用。
 - 双方都不可达（双 NAT、无公网入口、无隧道）时无法连通，插件只给出可读诊断，不无限重试。
 - 首版仅支持图片，不做一般文件/音频/视频传输。
@@ -254,7 +257,7 @@ AstrBot 插件详情页 → 打开「bridge」视图。包含四块：
 Set-Location <你的 AstrBot 目录>\data\plugins\astrbot_plugin_dsh_bridge; & ..\..\..\.venv\Scripts\python.exe -m pytest tests --ignore=tests/integration -o addopts="" -q
 ```
 
-含跨端集成目录的全量（**POSIX/WSL only**；会起真实回环 socket；2026-11-01 实测 business 4:07.94 + cross 2:38.53）。Windows 原生环境不提供该全量跑法，请改用 WSL 里的 Python 执行。
+含跨端集成目录的全量（**POSIX/WSL only**；会起真实回环 socket；2026-11-02 实测 business 4:14.83 + cross 2:45.26）。Windows 原生环境不提供该全量跑法，请改用 WSL 里的 Python 执行。
 
 WSL 侧需要准备一个能 import AstrBot、并装有 `pytest`/`pytest-asyncio` 的 Python；下面同样是一条**单行 PowerShell**，`<WSL 内插件目录>`、`<WSL 内 B 仓库>` 与 `<WSL 内 python>` 按本机替换：
 
@@ -280,7 +283,7 @@ Set-Location <你的 AstrBot 目录>; uv run pytest data\plugins\astrbot_plugin_
 
 ### 测试现状（历史快照，不等于当前验收）
 
-- **2026-11-01 当前快照**：A 全量单测 427 passed（28.27s）；B 全量单测 377 passed / 0 failed（33.63s）；A+B 真实 socket 业务回环 24 passed（248.38s）；跨传输 26 passed（160.19s）；独立密码学校验 36/36 passed；B `tsc -p tsconfig.json --noEmit` exit 0。命令与分项见 `开发/changelog.md`、`开发/v0.1/test/business-roundtrip-results.md`、`开发/v0.1/test/approval-lookup-results.md`。
+- **2026-11-02 当前快照**：A 全量单测 442 passed（31.17s，含新增 15 个真实宿主契约用例）；B 全量单测 377 passed / 0 failed（35.03s）；A+B 真实 socket 业务回环 24 passed（254.83s）；跨传输 26 passed（165.26s）；独立密码学校验 36/36 passed；B `tsc -p tsconfig.json --noEmit` exit 0。命令与分项见 `开发/changelog.md`、`开发/v0.1/test/llm-tool-host-contract-hotfix.md`、`开发/v0.1/test/business-roundtrip-results.md`、`开发/v0.1/test/approval-lookup-results.md`。
 - **更早的数字已作废**：A 360 / B 348 / business 22（17:35）、295/335、19 PASS / 7 `BLOCKED-IMPL` 等快照均已被取代，只作存档。
 - **静态检查**：`ruff format .` 与 `ruff check .` 对整个插件目录通过；B 的 `node --check` 全树通过，`tsc -p tsconfig.json --noEmit` exit 0。
 - **仍为 `BLOCKED-ENV`**：真实 AstrBot/DSH 宿主、真实 IM/OpenAPI SSE/TLS 未验证；竞争审批（两侧先答者胜）与 native approval id 竞争偏差仍是未满足项。
