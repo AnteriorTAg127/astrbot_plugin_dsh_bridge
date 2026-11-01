@@ -1,0 +1,9 @@
+# Third-party runtime dependencies actually imported by this plugin.
+# Minimum versions follow the host AstrBot 4.29.3 pyproject.toml, so installing
+# this file never asks for a version older than the host already requires.
+# AstrBot normally ships all four; this file exists for plugin-market installs
+# and for hosts that stripped an optional dependency.
+aiohttp>=3.11.18
+aiosqlite>=0.21.0
+cryptography>=44.0.3
+httpx>=0.28.1

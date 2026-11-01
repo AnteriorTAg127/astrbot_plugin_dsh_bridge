@@ -1,0 +1,3 @@
+# Run artefacts: the machine-readable copy of the last run's outcomes.
+_results/
+__pycache__/

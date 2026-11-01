@@ -1,0 +1,481 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>DSH 桥接</title>
+    <style>
+      :root {
+        color-scheme: light dark;
+        --bg: #f7f8fa;
+        --card: #ffffff;
+        --border: #e3e6eb;
+        --text: #1c1f23;
+        --muted: #6b7280;
+        --ok: #15803d;
+        --warn: #b45309;
+        --bad: #b91c1c;
+        --accent: #2563eb;
+      }
+      @media (prefers-color-scheme: dark) {
+        :root {
+          --bg: #12141a;
+          --card: #1b1e26;
+          --border: #2a2f3a;
+          --text: #e6e8ec;
+          --muted: #9aa2b1;
+          --ok: #4ade80;
+          --warn: #fbbf24;
+          --bad: #f87171;
+          --accent: #60a5fa;
+        }
+      }
+      * { box-sizing: border-box; }
+      body {
+        margin: 0;
+        padding: 20px;
+        background: var(--bg);
+        color: var(--text);
+        font: 14px/1.6 system-ui, -apple-system, "Segoe UI", "PingFang SC",
+          "Microsoft YaHei", sans-serif;
+      }
+      h1 { font-size: 20px; margin: 0 0 4px; }
+      .sub { color: var(--muted); margin-bottom: 18px; }
+      .grid { display: grid; gap: 16px; }
+      .card {
+        background: var(--card);
+        border: 1px solid var(--border);
+        border-radius: 10px;
+        padding: 14px 16px;
+      }
+      .card h2 {
+        font-size: 15px;
+        margin: 0 0 10px;
+        display: flex;
+        align-items: center;
+        gap: 8px;
+      }
+      .row {
+        display: flex;
+        justify-content: space-between;
+        gap: 12px;
+        padding: 4px 0;
+        border-bottom: 1px dashed var(--border);
+      }
+      .row:last-child { border-bottom: 0; }
+      .k { color: var(--muted); }
+      .v { text-align: right; word-break: break-all; }
+      .pill {
+        display: inline-block;
+        padding: 1px 8px;
+        border-radius: 999px;
+        font-size: 12px;
+        border: 1px solid var(--border);
+      }
+      .ok { color: var(--ok); }
+      .warn { color: var(--warn); }
+      .bad { color: var(--bad); }
+      table { width: 100%; border-collapse: collapse; font-size: 13px; }
+      th, td {
+        text-align: left;
+        padding: 6px 8px;
+        border-bottom: 1px solid var(--border);
+        vertical-align: top;
+      }
+      th { color: var(--muted); font-weight: 500; }
+      .empty { color: var(--muted); padding: 6px 0; }
+      button {
+        font: inherit;
+        padding: 3px 10px;
+        border-radius: 6px;
+        border: 1px solid var(--border);
+        background: transparent;
+        color: var(--text);
+        cursor: pointer;
+      }
+      button.primary { border-color: var(--accent); color: var(--accent); }
+      button.danger { border-color: var(--bad); color: var(--bad); }
+      button:disabled { opacity: 0.5; cursor: not-allowed; }
+      .toolbar { display: flex; gap: 8px; align-items: center; }
+      .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+      .notice {
+        border: 1px solid var(--warn);
+        color: var(--warn);
+        border-radius: 8px;
+        padding: 8px 12px;
+        margin-bottom: 14px;
+      }
+      .hint { color: var(--muted); font-size: 12px; }
+    </style>
+  </head>
+  <body>
+    <h1>DSH 桥接</h1>
+    <div class="sub">
+      AstrBot ↔ DeepSeek Harness 对等加密通道 · 本页仅展示状态与审批，不显示任何密钥
+    </div>
+
+    <div id="auth-notice" class="notice" hidden>
+      写操作不可用：需要 Dashboard 登录身份，或登录状态尚未确认；请通过 AstrBot 面板登录后再操作。
+    </div>
+
+    <div class="grid">
+      <section class="card" id="conn-card">
+        <h2>一、连接状态 <span id="conn-dot" class="pill">加载中…</span></h2>
+        <div id="conn-body"><div class="empty">正在读取…</div></div>
+      </section>
+
+      <section class="card" id="sessions-card">
+        <h2>二、会话授权 <span class="hint" id="quota-hint"></span></h2>
+        <div id="sessions-body"><div class="empty">正在读取…</div></div>
+      </section>
+
+      <section class="card" id="tasks-card">
+        <h2>三、任务进度与结果
+          <span class="toolbar" style="margin-left:auto">
+            <button id="refresh-tasks">刷新</button>
+          </span>
+        </h2>
+        <div id="tasks-body"><div class="empty">正在读取…</div></div>
+      </section>
+
+      <section class="card" id="approvals-card">
+        <h2>四、决策与审批
+          <span class="toolbar" style="margin-left:auto">
+            <button id="refresh-approvals">刷新</button>
+          </span>
+        </h2>
+        <div id="approvals-body"><div class="empty">正在读取…</div></div>
+      </section>
+    </div>
+
+    <script type="module">
+      const bridge = window.AstrBotPluginView || window.AstrBotPluginPage;
+      if (!bridge) {
+        document.body.innerHTML =
+          '<p style="padding:24px">此页面必须在 AstrBot 插件视图中打开。</p>';
+        throw new Error("plugin view bridge unavailable");
+      }
+
+      const state = { canWrite: false };
+
+      /** Escape text before injecting into HTML. */
+      const esc = (value) =>
+        String(value ?? "—").replace(/[&<>"']/g, (char) => ({
+          "&": "&amp;",
+          "<": "&lt;",
+          ">": "&gt;",
+          '"': "&quot;",
+          "'": "&#39;",
+        })[char]);
+
+      /** Format an ISO timestamp in the local time zone. */
+      const when = (iso) => {
+        if (!iso) return "—";
+        const date = new Date(iso);
+        return Number.isNaN(date.getTime()) ? esc(iso) : date.toLocaleString();
+      };
+
+      /** Map a connection state to a CSS class. */
+      const stateClass = (value) => {
+        if (["ready"].includes(value)) return "ok";
+        if (["connecting", "handshaking", "degraded", "draining"].includes(value)) return "warn";
+        if (["closed", "config_error"].includes(value)) return "bad";
+        return "";
+      };
+
+      const renderRows = (pairs) =>
+        pairs
+          .map(
+            ([key, value]) =>
+              `<div class="row"><span class="k">${esc(key)}</span><span class="v">${value}</span></div>`,
+          )
+          .join("");
+
+      /**
+       * Apply the current write capability to every write control.
+       *
+       * Controls start disabled because ``state.canWrite`` starts false, and
+       * only a successful ``GET status`` response may enable them.
+       */
+      function applyCanWrite() {
+        document.getElementById("auth-notice").hidden = state.canWrite;
+        const hint = document.getElementById("write-hint");
+        if (hint) hint.hidden = state.canWrite;
+        document.querySelectorAll("[data-write]").forEach((button) => {
+          button.disabled = !state.canWrite;
+        });
+      }
+
+      async function loadStatus() {
+        try {
+          const data = await bridge.apiGet("status");
+          // The backend status endpoint is the only source of write capability;
+          // keep writes disabled unless it returns the literal boolean true.
+          state.canWrite = data?.can_write === true;
+          const conn = data.connection || {};
+          const diag = data.diagnostics || {};
+          document.getElementById("conn-dot").textContent = conn.state || "未知";
+          document.getElementById("conn-dot").className =
+            "pill " + stateClass(conn.state);
+          document.getElementById("conn-body").innerHTML = renderRows([
+            ["连接标识", `<span class="mono">${esc(conn.conn_id)}</span>`],
+            ["模式", esc(conn.mode === "listen" ? "监听（listen）" : "发起（connect）")],
+            ["当前传输", esc(conn.transport || diag.preferred)],
+            ["首选传输", esc(diag.preferred)],
+            ["回退顺序", esc((diag.fallbacks || []).join(" → ") || "—")],
+            ["是否降级", diag.degraded ? '<span class="warn">是（已回退）</span>' : "否"],
+            ["对端可达", diag.reachable ? '<span class="ok">是</span>' : '<span class="bad">否</span>'],
+            ["对端宿主", esc(conn.peer_host)],
+            ["对端版本", esc(conn.peer_version)],
+            ["会话 ID", `<span class="mono">${esc(conn.sid)}</span>`],
+            ["PSK", conn.psk_configured ? '<span class="ok">已配置</span>' : '<span class="bad">未配置（无法连接）</span>'],
+            ["OpenAPI", conn.openapi_configured ? '<span class="ok">已配置</span>' : '<span class="warn">未配置（无法执行任务）</span>'],
+            ["最近错误", esc(conn.reason || diag.last_error)],
+          ]);
+          const history = data.transport_history || [];
+          if (history.length) {
+            const rows = history
+              .slice(-8)
+              .map(
+                (item) =>
+                  `<tr><td>${when(item.at)}</td><td>${esc(item.from || "—")}</td><td>${esc(item.to)}</td><td>${esc(item.reason)}</td></tr>`,
+              )
+              .join("");
+            document.getElementById("conn-body").innerHTML +=
+              `<div style="margin-top:12px"><div class="k">传输回退历史</div>` +
+              `<table><thead><tr><th>时间</th><th>从</th><th>到</th><th>原因</th></tr></thead>` +
+              `<tbody>${rows}</tbody></table></div>`;
+          }
+        } catch (error) {
+          // A failed status fetch must not preserve a previously granted flag.
+          state.canWrite = false;
+          document.getElementById("conn-body").innerHTML =
+            `<div class="empty bad">读取失败：${esc(error.message)}</div>`;
+        } finally {
+          applyCanWrite();
+        }
+      }
+
+      async function loadSessions() {
+        try {
+          const data = await bridge.apiGet("sessions");
+          const quota = data.quota || {};
+          document.getElementById("quota-hint").textContent =
+            `Agent 创建配额：${quota.used ?? 0}/${quota.max ?? 0}` +
+            `（允许创建：${quota.allow_agent_create ? "是" : "否"}）` +
+            ` · 授权版本 ${data.authz_version ?? 0}`;
+          const items = data.items || [];
+          if (!items.length) {
+            document.getElementById("sessions-body").innerHTML =
+              '<div class="empty">暂无授权会话。请在插件配置中允许 Agent 创建会话，或由管理员授权。</div>';
+            return;
+          }
+          const rows = items
+            .map((item) => {
+              const revoked = item.revoked;
+              const badge = revoked
+                ? '<span class="bad">已撤销</span>'
+                : item.archived
+                  ? '<span class="warn">已归档</span>'
+                  : '<span class="ok">有效</span>';
+              const action = revoked
+                ? '<button disabled>已撤销</button>'
+                : `<button class="danger" data-revoke="${esc(item.session_id)}" data-write ${state.canWrite ? "" : "disabled"}>撤销</button>`;
+              return (
+                `<tr><td class="mono">${esc(item.session_id)}</td>` +
+                `<td>${esc(item.purpose)}</td>` +
+                `<td>${esc(item.title)}</td>` +
+                `<td>${badge}</td>` +
+                `<td>${esc(item.granted_by)}<br><span class="hint">${esc(item.granted_by_id)}</span></td>` +
+                `<td>${esc(item.expires_at)}</td>` +
+                `<td>${action}</td></tr>`
+              );
+            })
+            .join("");
+          document.getElementById("sessions-body").innerHTML =
+            "<table><thead><tr><th>会话</th><th>用途</th><th>标题</th><th>状态</th>" +
+            "<th>授权来源</th><th>到期</th><th>操作</th></tr></thead>" +
+            `<tbody>${rows}</tbody></table>`;
+          document.querySelectorAll("[data-revoke]").forEach((button) => {
+            button.addEventListener("click", async () => {
+              const sessionId = button.getAttribute("data-revoke");
+              button.disabled = true;
+              try {
+                await bridge.apiPost(`sessions/${sessionId}/revoke`, {});
+                await loadSessions();
+              } catch (error) {
+                alert(`撤销失败：${error.message}`);
+                button.disabled = false;
+              }
+            });
+          });
+          applyCanWrite();
+        } catch (error) {
+          document.getElementById("sessions-body").innerHTML =
+            `<div class="empty bad">读取失败：${esc(error.message)}</div>`;
+        }
+      }
+
+      async function loadTasks() {
+        try {
+          const data = await bridge.apiGet("tasks", { limit: 20 });
+          const items = data.items || [];
+          if (!items.length) {
+            document.getElementById("tasks-body").innerHTML =
+              '<div class="empty">暂无任务。</div>';
+            return;
+          }
+          const rows = items
+            .map((task) => {
+              const direction =
+                task.direction === "outbound"
+                  ? '<span class="pill">本端发起 →</span>'
+                  : '<span class="pill">← 对端发起</span>';
+              const summary =
+                (task.result && task.result.summary) ||
+                (task.error && `${task.error.code}：${task.error.message}`) ||
+                "—";
+              const actions = task.needs_human
+                ? `<button data-resolve="${esc(task.task_id)}" data-action="retry" data-write ${state.canWrite ? "" : "disabled"}>重试</button>
+                   <button class="danger" data-resolve="${esc(task.task_id)}" data-action="cancel" data-write ${state.canWrite ? "" : "disabled"}>放弃</button>`
+                : "";
+              return (
+                `<tr><td class="mono">${esc(task.task_id).slice(0, 8)}…</td>` +
+                `<td>${direction}</td><td>${esc(task.status)}</td>` +
+                `<td>${esc(task.purpose)}</td><td>${esc(summary)}</td>` +
+                `<td>${when(task.updated_at)}</td>` +
+                `<td>${task.needs_human ? '<span class="warn">需人工</span>' : "—"}</td>` +
+                `<td>${actions}</td></tr>`
+              );
+            })
+            .join("");
+          document.getElementById("tasks-body").innerHTML =
+            "<table><thead><tr><th>任务</th><th>方向</th><th>状态</th><th>用途</th>" +
+            "<th>结果/错误</th><th>更新时间</th><th>标记</th><th>操作</th></tr></thead>" +
+            `<tbody>${rows}</tbody></table>`;
+          document.querySelectorAll("[data-resolve]").forEach((button) => {
+            button.addEventListener("click", async () => {
+              const taskId = button.getAttribute("data-resolve");
+              const action = button.getAttribute("data-action");
+              button.disabled = true;
+              try {
+                await bridge.apiPost(`tasks/${taskId}/resolve`, { action });
+                await loadTasks();
+              } catch (error) {
+                alert(`操作失败：${error.message}`);
+                button.disabled = false;
+              }
+            });
+          });
+          applyCanWrite();
+        } catch (error) {
+          document.getElementById("tasks-body").innerHTML =
+            `<div class="empty bad">读取失败：${esc(error.message)}</div>`;
+        }
+      }
+
+      async function loadApprovals() {
+        try {
+          const data = await bridge.apiGet("approvals");
+          const approvals = data.items || [];
+          const decisions = data.decisions || [];
+          const parts = [];
+          if (approvals.length) {
+            const rows = approvals
+              .map((item) => {
+                const reason =
+                  (item.display_reason && (item.display_reason.zh || item.display_reason.en)) ||
+                  item.reason ||
+                  "—";
+                const origin = item.origin_side === "B" ? "对端（DSH）" : "本端";
+                return (
+                  `<tr><td class="mono">${esc(item.approval_id).slice(0, 8)}…</td>` +
+                  `<td>${esc(item.approval_type)}</td><td>${esc(item.tool)}</td>` +
+                  `<td>${esc(reason)}</td><td>${esc(origin)}</td>` +
+                  `<td>${esc(item.expires_at)}</td>` +
+                  `<td><button class="primary" data-approve="${esc(item.approval_id)}" data-write ${state.canWrite ? "" : "disabled"}>批准一次</button>` +
+                  `<button class="danger" data-reject="${esc(item.approval_id)}" data-write ${state.canWrite ? "" : "disabled"}>拒绝</button></td></tr>`
+                );
+              })
+              .join("");
+            parts.push(
+              "<table><thead><tr><th>审批号</th><th>类型</th><th>动作</th><th>原因</th>" +
+                "<th>来源端</th><th>到期</th><th>操作</th></tr></thead>" +
+                `<tbody>${rows}</tbody></table>`,
+            );
+          }
+          if (decisions.length) {
+            const rows = decisions
+              .map(
+                (item) =>
+                  `<tr><td class="mono">${esc(item.decision_id).slice(0, 8)}…</td>` +
+                  `<td>${esc(item.question)}</td>` +
+                  `<td>${esc((item.options || []).map((option) => option.label || option.id).join(" / ") || "—")}</td>` +
+                  `<td>${esc(item.expires_at)}</td></tr>`,
+              )
+              .join("");
+            parts.push(
+              '<div class="k" style="margin-top:12px">待决策项（需人工选择）</div>' +
+                "<table><thead><tr><th>决策号</th><th>问题</th><th>选项</th><th>到期</th></tr></thead>" +
+                `<tbody>${rows}</tbody></table>`,
+            );
+          }
+          const notice =
+            '<div class="hint" id="write-hint" hidden>写操作不可用：需要 Dashboard 登录身份，插件作用域 API Key 不能审批。</div>';
+          document.getElementById("approvals-body").innerHTML =
+            notice +
+            (parts.length
+              ? parts.join("")
+              : '<div class="empty">暂无待处理审批或决策。</div>');
+          const decide = async (approvalId, outcome) => {
+            try {
+              const result = await bridge.apiPost(
+                `approvals/${approvalId}/decide`,
+                { outcome },
+              );
+              if (result && result.applied === false) {
+                alert(`该审批已被处理（${result.reason}），本次操作未生效。`);
+              }
+              await loadApprovals();
+            } catch (error) {
+              alert(`操作失败：${error.message}`);
+            }
+          };
+          document.querySelectorAll("[data-approve]").forEach((button) => {
+            button.addEventListener("click", () =>
+              decide(button.getAttribute("data-approve"), "allowed-once"),
+            );
+          });
+          document.querySelectorAll("[data-reject]").forEach((button) => {
+            button.addEventListener("click", () =>
+              decide(button.getAttribute("data-reject"), "rejected"),
+            );
+          });
+          applyCanWrite();
+        } catch (error) {
+          document.getElementById("approvals-body").innerHTML =
+            `<div class="empty bad">读取失败：${esc(error.message)}</div>`;
+        }
+      }
+
+      async function refreshAll() {
+        await loadStatus();
+        await Promise.all([loadSessions(), loadTasks(), loadApprovals()]);
+      }
+
+      document.getElementById("refresh-tasks").addEventListener("click", loadTasks);
+      document.getElementById("refresh-approvals").addEventListener("click", loadApprovals);
+
+      // Fail closed before any network call; the Dashboard context never grants
+      // write rights by itself.
+      applyCanWrite();
+      await bridge.ready().catch(() => {});
+      await refreshAll();
+      setInterval(loadStatus, 10000);
+      setInterval(() => {
+        loadTasks();
+        loadApprovals();
+      }, 15000);
+    </script>
+  </body>
+</html>

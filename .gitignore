@@ -205,3 +205,69 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+# ---------------------------------------------------------------------------
+# AstrBot plugin bridge — project specific ignores
+# ---------------------------------------------------------------------------
+
+# Development process documents (never committed)
+开发/
+# Explicit duplicate guard for local API test credentials
+开发/api_config.json
+# Secrets / local credentials
+.env
+.env.*
+*.pem
+*.key
+*.crt
+*.p12
+secrets.json
+credentials.json
+api_config.json
+# Runtime cache / dependency artifacts
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+venv_astrbot/
+.cache/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+node_modules/
+# The trailing-slash rule above only matches a real directory. A vendored
+# `node_modules` is often a symlink (e.g. to the harness dependency tree), so a
+# slash-less rule is needed as well — otherwise the link is a trackable path
+# pointing at someone's absolute filesystem layout.
+node_modules
+# Build artifacts / distributions
+dist/
+build/
+*.egg-info/
+*.zip
+*.log
+# Editor / OS noise
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# ---------------------------------------------------------------------------
+# AstrBot runtime data directories (never committed)
+# ---------------------------------------------------------------------------
+# AstrBot's data root defaults to the current working directory (`ASTRBOT_ROOT`
+# overrides it), so importing the plugin — including from a test run started in
+# this directory — makes `data/` the host data root and writes it *here*. It holds
+# the host's live configuration (`cmd_config.json`) and text-to-image templates:
+# per-user data, not plugin source. This project only ignores it; it never
+# deletes it and never reads its contents.
+#
+# Patterns are anchored and narrow so a real fixture directory stays trackable —
+# `tests/fixtures/` is not touched. Note git cannot re-include a path whose parent
+# directory is ignored, so fixtures must not live inside a directory literally
+# named `data`; keep them in `tests/fixtures/`.
+/data/
+/tests/**/data/
+# Harness run artifacts (`_results/last-run.json` and similar): local evidence of
+# one run, never source and never part of a delivery archive.
+/tests/**/_results/

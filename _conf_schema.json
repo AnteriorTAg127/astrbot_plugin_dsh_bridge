@@ -1,0 +1,232 @@
+{
+  "connections": {
+    "type": "template_list",
+    "description": "桥接连接",
+    "hint": "每条连接对应一个对端（DSH 或另一 AstrBot）。两端的 conn_id / psk 必须一致，模式必须相反（一端 connect、另一端 listen）。",
+    "templates": {
+      "dsh_bridge": {
+        "name": "DSH 桥接连接",
+        "hint": "AstrBot ↔ DSH 的标准连接模板",
+        "display_item": "conn_id",
+        "items": {
+          "conn_id": {
+            "description": "连接标识",
+            "type": "string",
+            "default": "default",
+            "hint": "协议里的 conn，两端必须完全一致。仅允许小写字母、数字、下划线与连字符。"
+          },
+          "conn_mode": {
+            "description": "连接模式",
+            "type": "string",
+            "default": "connect",
+            "options": ["connect", "listen"],
+            "labels": ["发起连接（connect）", "监听等待（listen）"],
+            "hint": "两端必须相反。connect 侧主动连出，listen 侧自建端口等待。"
+          },
+          "conn_transport": {
+            "description": "首选传输",
+            "type": "string",
+            "default": "ws",
+            "options": ["ws", "webhook", "longpoll"],
+            "labels": ["WebSocket（ws/wss）", "HTTP Webhook", "HTTP 长轮询"],
+            "hint": "WebSocket 只需单向可达；Webhook 需要双向可达；长轮询适合只能单向连出的场景。"
+          },
+          "conn_transport_fallback": {
+            "description": "回退顺序",
+            "type": "list",
+            "default": ["longpoll"],
+            "hint": "首选传输失败时按顺序尝试。Webhook 回投探测失败会自动回退到此处第一项。"
+          },
+          "conn_host": {
+            "description": "对端地址",
+            "type": "string",
+            "default": "127.0.0.1",
+            "hint": "connect 侧填对端地址；listen 侧填本机绑定地址。"
+          },
+          "conn_port": {
+            "description": "对端端口",
+            "type": "int",
+            "default": 8765,
+            "hint": "connect 侧填对端端口；listen 侧填本机监听端口。"
+          },
+          "conn_bind_addr": {
+            "description": "本端监听地址",
+            "type": "string",
+            "default": "0.0.0.0",
+            "hint": "本端入站监听地址，与对端地址 conn_host 无关：connect 侧也可填此值作为回投监听地址；listen 侧在此地址上等待连接。填 127.0.0.1 表示仅本机可达。"
+          },
+          "conn_bind_port": {
+            "description": "本端监听端口",
+            "type": "int",
+            "default": 0,
+            "hint": "本端入站监听端口，与对端端口 conn_port 无关：listen 侧用它对外提供服务；0 表示由系统临时分配。取值范围 0-65535。"
+          },
+          "conn_path": {
+            "description": "路径前缀",
+            "type": "string",
+            "default": "/dsh-bridge",
+            "hint": "两端必须一致。"
+          },
+          "conn_tls_enabled": {
+            "description": "启用 TLS",
+            "type": "bool",
+            "default": false,
+            "hint": "开启后使用 wss/https。即使不开启，握手与 AEAD 加密仍然生效。"
+          },
+          "conn_tls_cert_path": {
+            "description": "TLS 证书路径",
+            "type": "string",
+            "default": "",
+            "hint": "仅 listen 侧需要。"
+          },
+          "conn_tls_key_path": {
+            "description": "TLS 私钥路径",
+            "type": "string",
+            "default": "",
+            "hint": "仅 listen 侧需要。"
+          },
+          "conn_tls_fingerprint": {
+            "description": "对端证书 SHA-256 指纹",
+            "type": "string",
+            "default": "",
+            "hint": "填了则强制校验，不匹配即拒绝连接；不会静默跳过校验。"
+          },
+          "conn_psk_id": {
+            "description": "预共享密钥标识",
+            "type": "string",
+            "default": "",
+            "hint": "非密钥，两端必须一致。留空表示该连接未配置，插件将拒绝建立连接。"
+          },
+          "conn_psk_secret": {
+            "description": "预共享密钥",
+            "type": "string",
+            "default": "",
+            "secret": true,
+            "hint": "两端必须一致。请使用至少 32 字符的随机串；插件不会生成、不会上传、不会写入日志。"
+          },
+          "conn_allow_agent_create": {
+            "description": "允许 Agent 创建会话",
+            "type": "bool",
+            "default": true,
+            "hint": "开启后，Agent 在本连接内创建会话即自动授权（带审计标记），无需逐个人工批准。"
+          },
+          "conn_max_agent_sessions": {
+            "description": "Agent 会话数量上限",
+            "type": "int",
+            "default": 10,
+            "hint": "Agent 自动创建并授权的会话总数上限。达到上限后创建被拒绝，不会自动扩容。"
+          }
+        }
+      }
+    }
+  },
+  "addr_allow_private": {
+    "description": "允许连接非本机私网地址",
+    "type": "bool",
+    "default": false,
+    "hint": "开启后允许连接 RFC1918 私网地址。127.0.0.1 等本机地址始终允许；默认关闭以防误配探测内网。"
+  },
+  "heartbeat_interval": {
+    "description": "心跳间隔（秒）",
+    "type": "int",
+    "default": 30,
+    "hint": "无其他出站帧时每 N 秒发送一次应用层心跳；连续 2 个周期无入站帧判定断线。"
+  },
+  "reconnect_max_backoff": {
+    "description": "重连最大退避（秒）",
+    "type": "int",
+    "default": 60,
+    "hint": "指数退避的上限。首次 1 秒，逐次翻倍，带 ±20% 抖动。"
+  },
+  "task_retention_days": {
+    "description": "任务保留天数",
+    "type": "int",
+    "default": 7,
+    "hint": "任务、事件、审批、通知的保留期；到期由后台清理，且不阻塞主流程。"
+  },
+  "approval_timeout_seconds": {
+    "description": "审批超时（秒）",
+    "type": "int",
+    "default": 1800,
+    "hint": "超时一律按拒绝处理，不会自动批准；超时后任务转人工处置。"
+  },
+  "approval_notify_channels": {
+    "description": "审批通知渠道",
+    "type": "list",
+    "default": ["im", "web"],
+    "hint": "有可用 IM 平台时同时发 IM；没有 IM 平台时只落 Web 页，属正常降级。"
+  },
+  "approval_notify_umo": {
+    "description": "审批通知会话 UMO",
+    "type": "string",
+    "default": "",
+    "hint": "留空时审批通知只发 Web 页、不发 IM；仅填写本机已存在的会话 UMO 时才会额外发送 IM。"
+  },
+  "wake_max_chain": {
+    "description": "每个根任务自动唤醒链上限",
+    "type": "int",
+    "default": 8,
+    "hint": "达到上限立即停止自动唤醒，任务转人工处置并通知人。"
+  },
+  "wake_rate_per_minute": {
+    "description": "自动唤醒限速（次/分钟）",
+    "type": "int",
+    "default": 10,
+    "hint": "按连接与会话的滑动窗口计数；计数跨重启保留。"
+  },
+  "image_enabled": {
+    "description": "允许图片输入",
+    "type": "bool",
+    "default": true,
+    "hint": "仅支持图片（png/jpeg/webp/gif），不支持一般文件。"
+  },
+  "image_max_count": {
+    "description": "单任务图片张数上限",
+    "type": "int",
+    "default": 4,
+    "hint": "超出则整条任务提交被原子拒绝，不会部分接收。"
+  },
+  "image_max_bytes": {
+    "description": "单张图片字节上限",
+    "type": "int",
+    "default": 10485760,
+    "hint": "默认 10 MiB。不得超过宿主上限。"
+  },
+  "image_total_max_bytes": {
+    "description": "单任务图片总字节上限",
+    "type": "int",
+    "default": 20971520,
+    "hint": "默认 20 MiB。"
+  },
+  "image_allowed_mime": {
+    "description": "允许的图片类型",
+    "type": "list",
+    "default": ["image/gif", "image/jpeg", "image/png", "image/webp"],
+    "hint": "白名单封闭。实际字节必须与声明类型一致（校验魔数与尺寸）。"
+  },
+  "openapi_base_url": {
+    "description": "本机 OpenAPI 地址",
+    "type": "string",
+    "default": "http://127.0.0.1:6185",
+    "hint": "仅供本插件调用本机 AstrBot 使用，不是桥接传输通道。仅允许本机地址，或在开启私网允许后使用内网地址。"
+  },
+  "openapi_api_key": {
+    "description": "本机 OpenAPI Key",
+    "type": "string",
+    "default": "",
+    "secret": true,
+    "hint": "在 WebUI 设置 → OpenAPI 中创建。只需 chat 权限（启用图片时再加 file）；切勿授予 data 或 chat:admin。此 Key 永不跨端传输、不入库、不写日志。"
+  },
+  "openapi_key_id": {
+    "description": "本机 OpenAPI Key 标识",
+    "type": "string",
+    "default": "",
+    "hint": "Key 的 key_id（非密钥）。用于启动时自检身份归属，必须与实际 Key 一一对应；不一致将拒绝启动。"
+  },
+  "dashboard_enabled": {
+    "description": "启用后台状态接口",
+    "type": "bool",
+    "default": true,
+    "hint": "仅控制是否注册本插件的后台后端接口（状态/任务/审批等 API）。关闭后这些接口不再注册，但 AstrBot 宿主仍会扫描插件目录中的 views/bridge/，入口仍可能出现；由于接口缺失，页面内对应的后端接口请求会 404。指令、LLM 工具与任务面不受影响。"
+  }
+}
