@@ -12,7 +12,7 @@
 > 协议主本 `开发/v0.1/protocol.md` 属于**内部开发工作记录，不随公开仓库/交付包发布**；
 > 公开可复核的金标准向量是本仓库 [`tests/fixtures/protocol_vectors_v1.json`](tests/fixtures/protocol_vectors_v1.json)。
 
-**版本状态**：插件 `v0.1.0`（`metadata.yaml` 的 `astrbot_version` 为 `>=4.16,<5`）。对端 DSH 侧插件同为 `0.1.0`，面向 `@deepseek-ai/dsh` **`0.2.1-rc.2`**。本地测试环境为 **AstrBot 4.29.3 / Python 3.12.16**；用户环境报告为 **4.29.4**，本轮未在 4.29.4 上真实运行验收，只有本机 4.29.3 的宿主契约测试与用户截图所示契约一致，不能据此宣称 4.29.4 已通过。其余 AstrBot 版本均未实测。主要功能已实现，但仍有待真实环境验证项（见文末「已知限制与未验证项」）；**当前快照（2026-11-02）**：A 全量单测 **442 passed**、B **377 passed**、A+B 真实 socket 业务回环 **24 passed**、跨传输 **26 passed**、独立密码学校验 **36/36**，B `tsc -p tsconfig.json --noEmit` 通过。**真实 AstrBot 宿主内的整机联调、真实 OpenAPI/SSE 流、真实 IM 平台、真实 LLM 多模态判定与 TLS 均未验证（BLOCKED-ENV）**。部署前请先读文末「测试现状」与「已知限制与未验证项」。用户命令统一写成**单行 PowerShell**；`tests/integration/` 中的跨传输 harness 仅支持 POSIX（依赖 `/proc` 与进程组信号），Windows 原生环境不宣称跑通含 integration 的全量，请改用 WSL 执行（命令仍为单行 PowerShell，见「开发」）。
+**版本状态**：插件 `v0.1.0`（`metadata.yaml` 的 `astrbot_version` 为 `>=4.16,<5`）。对端 DSH 侧插件同为 `0.1.0`，面向 `@deepseek-ai/dsh` **`0.2.1-rc.2`**。本地测试环境为 **AstrBot 4.29.3 / Python 3.12.16**；用户环境报告为 **4.29.4**，本轮未在 4.29.4 上真实运行验收，只有本机 4.29.3 的宿主契约测试与用户截图所示契约一致，不能据此宣称 4.29.4 已通过。其余 AstrBot 版本均未实测。主要功能已实现，但仍有待真实环境验证项（见文末「已知限制与未验证项」）；**当前快照（2026-11-02）**：A 全量单测 **448 passed**、B **377 passed**、A+B 真实 socket 业务回环 **24 passed**、跨传输 **26 passed**、独立密码学校验 **36/36**，B `tsc -p tsconfig.json --noEmit` 通过。**真实 AstrBot 宿主内的整机联调、真实 OpenAPI/SSE 流、真实 IM 平台、真实 LLM 多模态判定与 TLS 均未验证（BLOCKED-ENV）**。部署前请先读文末「测试现状」与「已知限制与未验证项」。用户命令统一写成**单行 PowerShell**；`tests/integration/` 中的跨传输 harness 仅支持 POSIX（依赖 `/proc` 与进程组信号），Windows 原生环境不宣称跑通含 integration 的全量，请改用 WSL 执行（命令仍为单行 PowerShell，见「开发」）。
 
 ## 功能
 
@@ -20,7 +20,7 @@
 - **对等双向任务**：A→B 与 B→A 完全对称；提交**立即返回** `accepted` / `pending_approval` + `task_id`，结果异步回传。
 - **持久化与幂等**：任务、事件、审批、授权、唤醒计数存 SQLite（`data/plugin_data/astrbot_plugin_dsh_bridge/bridge.db`），重启不丢。
 - **人工审批与业务决策**：三类审批（业务决策 / 跨端提交 / DSH 原生工具）统一进 A 侧待审批队列；**A 侧队列内**同一审批首个答复生效。DSH 原生审批采用 B 侧 claim-or-hand-back，本地 UI 与远端人类并不会同时对同一请求作答——这与原始需求「双方都能答、先答者胜」**不等价**，该竞争语义仍未实现（见「已知限制与未验证项」）。
-- **会话授权治理**：A 侧是授权权威；Agent 在后台授予的**创建配额**内创建会话即自动授权（带审计标记），超配额拒绝；归档会话在 `task.submit` 处按 `session_archived` 拒绝，自动唤醒投递也会跳过归档会话（不再消耗唤醒链/限速预算）。
+- **会话授权治理**：A 侧是授权权威；Agent 在后台授予的**创建配额**内创建会话即自动授权（带审计标记），超配额拒绝；归档会话在 `task.submit` 处按 `session_archived` 拒绝，自动唤醒投递也会跳过归档会话（不再消耗唤醒链/限速预算）。会话列表与管理员列表输出**完整 UUID**；选择只接受完整 UUID，不支持前缀、不自动选第一个；`dsh_select_session` 当前只做授权校验，不绑定/不切换任务，也不改写已批准内容。
 - **图片输入**：仅任务显式附件，四类 MIME、字节/张数/像素受限，魔数校验；**绝不**抓取任意外部 URL 或聊天历史图片。
 - **中文后台页**：连接状态、会话授权、任务进度、审批四块，**不显示任何密钥**。
 
@@ -148,7 +148,7 @@ A 侧已经把「本端监听」与「对端地址」拆成两组字段（`conn_
 | `/dsh help` | 所有用户 | 帮助 |
 | `/dsh status` | 管理员 | 连接、传输、对端版本、最近错误 |
 | `/dsh tasks [n]` | 管理员 | 最近任务（`→` 本端发起 / `←` 对端发起） |
-| `/dsh sessions` | 管理员 | 会话授权与 Agent 创建配额 |
+| `/dsh sessions` | 管理员 | 会话授权与 Agent 创建配额（会话 ID 为完整 UUID） |
 | `/dsh approve <审批号>` | 管理员 | 批准**一次**（审批号可用前几位） |
 | `/dsh reject <审批号> [理由]` | 管理员 | 拒绝 |
 
@@ -156,11 +156,15 @@ A 侧已经把「本端监听」与「对端地址」拆成两组字段（`conn_
 
 | 工具 | 说明 |
 |---|---|
-| `dsh_submit_task` | 提交跨端任务，立即返回 `task_id`（**不会**同步等结果） |
+| `dsh_submit_task` | 提交跨端任务，立即返回 `task_id`（**不会**同步等结果；必须显式传完整 `session_id`） |
 | `dsh_task_status` | 幂等查询任务状态 |
-| `dsh_list_sessions` | 列授权范围内的会话（含用途） |
+| `dsh_list_sessions` | 列授权范围内的会话（含用途；输出完整 UUID） |
 | `dsh_create_session` | 在配额内创建会话（自动授权） |
-| `dsh_select_session` | 为任务选择授权会话 |
+| `dsh_select_session` | 校验授权会话（**只校验，不绑定/不切换任务**） |
+
+> **会话 ID 不截断、不接受前缀**：`dsh_list_sessions` 与 `/dsh sessions` 都输出完整 UUID；`dsh_select_session`
+> 只接受授权范围内的完整 UUID，不会把 8 位前缀解析成会话、不会自动选第一个、不会放宽授权。
+> `dsh_select_session` 当前是只读授权检查：它不修改 pending 任务，也不改变已批准内容（任务/审批摘要在人工批准前已落盘）。
 
 > 这五个适配器是真正的 `FunctionTool` 子类：`handler` 指向实例的 `__call__`，`handler_module_path` 由宿主的 `Context.add_llm_tools` 在注册时写入。因此它们能通过宿主的 `_PermissionGuardedTool` 权限包装与 `FunctionToolExecutor`；恢复为裸类或仅加 `handler` 属性都会在宿主执行时触发 `AttributeError: ... has no attribute 'handler'`。热修同时覆盖“停用（保留工具行）→启用”、卸载按模块路径移除，以及 `initialize` 局部失败后的资源回收。该结论只在本地 AstrBot **4.29.3** 的宿主契约测试中验证，不代表用户报告的 4.29.4 已完成真实运行验收。
 
@@ -283,7 +287,7 @@ Set-Location <你的 AstrBot 目录>; uv run pytest data\plugins\astrbot_plugin_
 
 ### 测试现状（历史快照，不等于当前验收）
 
-- **2026-11-02 当前快照**：A 全量单测 442 passed（31.17s，含新增 15 个真实宿主契约用例）；B 全量单测 377 passed / 0 failed（35.03s）；A+B 真实 socket 业务回环 24 passed（254.83s）；跨传输 26 passed（165.26s）；独立密码学校验 36/36 passed；B `tsc -p tsconfig.json --noEmit` exit 0。命令与分项见 `开发/changelog.md`、`开发/v0.1/test/llm-tool-host-contract-hotfix.md`、`开发/v0.1/test/business-roundtrip-results.md`、`开发/v0.1/test/approval-lookup-results.md`。
+- **2026-11-02 当前快照**：A 全量单测 448 passed（32.11s，含 15 个真实宿主契约用例与本热修 6 个会话 ID 完整性用例）；B 全量单测 377 passed / 0 failed（35.03s）；A+B 真实 socket 业务回环 24 passed（254.83s）；跨传输 26 passed（165.26s）；独立密码学校验 36/36 passed；B `tsc -p tsconfig.json --noEmit` exit 0。命令与分项见 `开发/changelog.md`、`开发/v0.1/test/llm-tool-host-contract-hotfix.md`、`开发/v0.1/test/session-id-integrity-hotfix.md`、`开发/v0.1/test/business-roundtrip-results.md`、`开发/v0.1/test/approval-lookup-results.md`。
 - **更早的数字已作废**：A 360 / B 348 / business 22（17:35）、295/335、19 PASS / 7 `BLOCKED-IMPL` 等快照均已被取代，只作存档。
 - **静态检查**：`ruff format .` 与 `ruff check .` 对整个插件目录通过；B 的 `node --check` 全树通过，`tsc -p tsconfig.json --noEmit` exit 0。
 - **仍为 `BLOCKED-ENV`**：真实 AstrBot/DSH 宿主、真实 IM/OpenAPI SSE/TLS 未验证；竞争审批（两侧先答者胜）与 native approval id 竞争偏差仍是未满足项。

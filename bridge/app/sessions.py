@@ -217,13 +217,20 @@ class SessionService:
         }
 
     async def select_session(self, params: dict) -> dict:
-        """``session.select``: switch a task onto an authorized session (§9.7).
+        """``session.select``: validate an authorized session for a task (§9.7).
+
+        This is deliberately a read-only check. A pending outbound task and its
+        approval gate are stored before a human answers, and ``submit_digest``
+        covers ``session_id``; rewriting either here would change
+        already-approved content. The operation therefore only verifies the
+        grant/archive state and logs the request, and callers must not claim a
+        task binding.
 
         Args:
             params: ``{"task_id", "session_id"}``.
 
         Returns:
-            ``{"ok": True}``.
+            ``{"ok": True}`` after the session passed validation.
 
         Raises:
             BridgeError: ``session_not_authorized`` / ``session_archived``.
@@ -239,7 +246,8 @@ class SessionService:
         if grant is not None and grant["archived"]:
             raise BridgeError(ERR_SESSION_ARCHIVED)
         logger.info(
-            "bridge session selected conn=%s task=%s session=%s",
+            "bridge session select validated (no task binding) conn=%s task=%s "
+            "session=%s",
             self._conn,
             task_id,
             session_id,

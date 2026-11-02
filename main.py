@@ -1714,12 +1714,13 @@ class DshBridgePlugin(Star):
             return
         lines = [
             f"【会话授权】Agent 配额 {quota['used']}/{quota['max']}"
-            f"（允许创建：{'是' if quota['allow_agent_create'] else '否'}）"
+            f"（允许创建：{'是' if quota['allow_agent_create'] else '否'}；"
+            "会话 ID 为完整 UUID）"
         ]
         for grant in grants[:20]:
             state = "已撤销" if grant["revoked"] else "有效"
             lines.append(
-                f"{grant['session_id'][:8]} {state} 用途={grant['purpose'] or '-'} "
+                f"{grant['session_id']} {state} 用途={grant['purpose'] or '-'} "
                 f"来源={grant['granted_by']}"
             )
         yield event.plain_result("\n".join(lines))
@@ -1957,10 +1958,10 @@ class DshBridgePlugin(Star):
         )
         if not payload["sessions"]:
             return "授权范围内暂无可用会话。"
-        lines = ["授权范围内的会话："]
+        lines = ["授权范围内的会话（完整 UUID）："]
         for item in payload["sessions"]:
             lines.append(
-                f"{item['session_id'][:8]} 用途={item['purpose'] or '-'} "
+                f"{item['session_id']} 用途={item['purpose'] or '-'} "
                 f"状态={item['state']}"
             )
         return "\n".join(lines)
@@ -1991,12 +1992,18 @@ class DshBridgePlugin(Star):
     async def llm_select_session(
         self, event: AstrMessageEvent, task_id: str, session_id: str
     ) -> str:
-        """Select an authorized session for a task.
+        """Validate an authorized session for a task (no task binding).
+
+        ``session.select`` is a read-only authorization check here: the pending
+        task and its approval gate were stored before a human answered, and the
+        approved ``submit_digest`` covers ``session_id``. Rewriting the task now
+        would change already-approved content, so this tool never binds or
+        switches it.
 
         Args:
             event: Incoming message event.
-            task_id: Task identifier.
-            session_id: Session identifier.
+            task_id: Task identifier (logged for audit; not modified).
+            session_id: Full authorized session identifier.
 
         Returns:
             Human-readable result.
@@ -2008,8 +2015,13 @@ class DshBridgePlugin(Star):
                 {"task_id": task_id, "session_id": session_id}
             )
         except BridgeError as exc:
-            return f"切换会话失败：{exc.code}"
-        return f"已将会话 {session_id} 绑定到任务 {task_id}。"
+            return (
+                f"校验会话失败：{exc.code}（请使用 dsh_list_sessions 返回的完整 UUID）"
+            )
+        return (
+            f"已校验会话 {session_id}：授权有效且未归档；"
+            f"仅校验，不修改任务 {task_id}（本工具不会绑定或切换任务）。"
+        )
 
     # -- dashboard APIs ----------------------------------------------------------------
 
@@ -2405,7 +2417,8 @@ class DshListSessionsTool(_DshLlmTool):
     name = "dsh_list_sessions"
     description = (
         "List the sessions authorized for agent use, with their purpose. Only "
-        "authorized sessions are visible."
+        "authorized sessions are visible and every session_id is a full UUID; pass "
+        "it unchanged to dsh_select_session or dsh_submit_task."
     )
     parameters = {
         "type": "object",
@@ -2468,17 +2481,25 @@ class DshCreateSessionTool(_DshLlmTool):
 
 
 class DshSelectSessionTool(_DshLlmTool):
-    """LLM tool ``dsh_select_session``: bind a task to an authorized session."""
+    """LLM tool ``dsh_select_session``: validate a session for a task (no binding)."""
 
     name = "dsh_select_session"
     description = (
-        "Select an authorized session for a task. Unauthorized sessions are refused."
+        "Validate that an authorized, non-archived session can be used for a task. "
+        "This is a read-only authorization check: it does not bind, switch or modify "
+        "the task. Use dsh_list_sessions and pass the full session UUID."
     )
     parameters = {
         "type": "object",
         "properties": {
             "task_id": {"type": "string", "description": "Task identifier."},
-            "session_id": {"type": "string", "description": "Session identifier."},
+            "session_id": {
+                "type": "string",
+                "description": (
+                    "Full authorized session UUID, as returned by "
+                    "dsh_list_sessions. Prefixes are not accepted."
+                ),
+            },
         },
         "required": ["task_id", "session_id"],
     }
@@ -2491,7 +2512,7 @@ class DshSelectSessionTool(_DshLlmTool):
         Args:
             event: Incoming message event.
             task_id: Task identifier.
-            session_id: Session identifier.
+            session_id: Full authorized session UUID.
 
         Returns:
             Human-readable result.
