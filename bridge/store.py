@@ -1660,6 +1660,31 @@ class Store:
             row = await cursor.fetchone()
         return int(row["version"]) if row is not None else 0
 
+    async def raise_authz_version_floor(self, minimum: int) -> int:
+        """Raise the authorization counter to at least ``minimum``.
+
+        A peer-side create advances the peer's cached table by one and the peer
+        ignores any later ``session.authz`` push that is not strictly higher
+        (§9.7). Adopting the version returned by the create reply before the
+        local grant bump therefore keeps this endpoint's authoritative pushes
+        (including revokes) acceptable. The counter is only ever raised.
+
+        Args:
+            minimum: Lowest version the local counter must reach.
+
+        Returns:
+            The resulting authorization version.
+        """
+        db = self._conn()
+        await db.execute(
+            "UPDATE authz_meta SET version = ? WHERE id = 1 AND version < ?",
+            (int(minimum), int(minimum)),
+        )
+        await db.commit()
+        async with db.execute("SELECT version FROM authz_meta WHERE id = 1") as cursor:
+            row = await cursor.fetchone()
+        return int(row["version"]) if row is not None else 0
+
     async def set_agent_create_policy(self, allow: bool, max_sessions: int) -> int:
         """Update the agent session-creation policy and bump the version.
 

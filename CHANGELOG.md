@@ -30,6 +30,7 @@
 - **LLM 工具宿主契约（v0.1 热修，不改变版本）**：五个 `dsh_*` 适配器改为真正的 `FunctionTool` 子类，`handler` 指向实例 `__call__`，`handler_module_path` 由宿主 `Context.add_llm_tools` 写入。修复裸类缺少 `handler` 时宿主 `_PermissionGuardedTool`/`PluginManager.load` 触发 `AttributeError` 的问题；保留原有参数、权限/审批与显式 `session_id` 语义。该结论仅在本机 AstrBot 4.29.3 的宿主契约测试中验证，**未在用户报告的 4.29.4 上真实运行验收**，截图只能说明契约一致。
 - **初始化局部失败清理**：`initialize` 在 `Store.init` 之后任一步骤失败（含取消）时先 `await terminate()` 再重抛原异常；清理本身失败不掩盖原异常。`terminate` 保持幂等并重置工具注册标记。没有用户失败日志，不能据此宣称所有间歇性 reload 问题均已解决。
 - **会话 ID 完整性与选择语义（v0.1 热修，不改变版本）**：`dsh_list_sessions` 与 `/dsh sessions` 改为输出完整 UUID，不再显示 `session_id[:8]`；共享前 8 位的两个授权会话因此可区分，列表中的值可直接用于选择。`dsh_select_session` 仍只接受授权范围内的完整 UUID（不支持前缀、不自动选第一个、未授权/已撤销同码拒绝），但文案与工具描述改为**只校验、不绑定**：pending 任务与审批 `submit_digest` 在人工批准前已落盘，事后改写会改变已批准内容，所以本热修不实现任务绑定，也不谎称已绑定。显式 `session_id` 仍原样进入任务审批门，缺省继续拒绝。
+- **Agent 创建不再是本机幽灵会话（v0.1 热修，不改变版本）**：`dsh_create_session` 改为先通过活动连接向对端 `session.create`，**只授权对端返回的 `session_id`**；无 READY 连接、对端超时、`session_create_denied`、`session_quota_exceeded`、`capability_unavailable`、`unknown_message` 等失败一律返回且**不写本地授权**。同一 `request_id` 只往返一次；出站幂等键加方向前缀，与对端选定的入站键隔离（入站键占用该前缀会被拒绝）；管理员撤销后重放同一创建键会失败关闭，不会复活会话。另用对端返回的 `authz_version` 抬高本端版本下限（只增不减），保证随后的权威推送（含撤销）不会被 B 当成 stale 丢弃。入站 `session.create` 仍按原语义惰性本地建会话（AstrBot 按需创建），两条路径代码与注释分开。升级前旧代码留下的授权行不会自动清理，需管理员在状态页撤销。
 
 ### 测试
 
@@ -37,7 +38,8 @@
 - 新增业务决策迟到答复回归：真实过期行 → 迟到真人答复被拒 → 超时扫描 → 再次扫描，断言仅一次 `timed_out` 回调、零人类 choice 回调，且扫描后状态为 `expired`。
 - 新增 `tests/test_llm_tool_host_contract.py`：使用真实 `Context.add_llm_tools`、`FunctionToolManager.get_full_tool_set`、`_PermissionGuardedTool`、`FunctionToolExecutor.execute` 覆盖五个工具的参数/事件/显式 session 原样转发、权限拒绝不触达业务方法、重复注册去重、停用保留行后新实例重绑不误归属、真实 `_unbind_plugin` 按模块路径移除、`terminate` 两次、同实例重新 `initialize`、局部失败/取消/清理失败三条异常路径。修复前该文件在真实执行路径稳定复现 `AttributeError: 'DshSubmitTaskTool' object has no attribute 'handler'`。
 - 新增 `tests/test_session_id_integrity.py`（6 个用例）：真实 `Store`/`SessionService`/`TaskService`/`ApprovalService` + 真实工具适配器，覆盖两个同前缀授权会话的完整 UUID 展示、`/dsh sessions` 管理员展示、完整 UUID 通过而唯一前缀仍被拒、select 不改写 pending 任务/审批摘要、显式 `session_id` 原样进入审批门、工具描述不声称绑定。修复前 **5 failed, 1 passed（1.20s）**，修复后 **6 passed（0.58s）**。
-- **当前快照（2026-11-02）**：A 全量单测 **448 passed**（32.11s，含本热修 6 个会话 ID 完整性用例）、B **377 passed**（35.03s）、A+B 业务回环 **24 passed**（254.83s）、跨传输 **26 passed**（165.26s）、独立密码学校验 **36/36**；B `tsc -p tsconfig.json --noEmit` exit 0。更早的 394/355、360/348/22 与 295/335、19 PASS / 7 `BLOCKED-IMPL` 记录已经作废，仅存档。真实宿主整机验收仍 `BLOCKED-ENV`；用户环境 4.29.4 未真实运行验收。
+- 新增 `tests/test_peer_session_creation.py`（22 个用例）：真实 `Store`/`SessionService` + 记录型 live session。覆盖对端 id 才被授权、无 READY 连接/对端超时/拒权/配额/未知消息/传输异常/畸形应答均零授权、同 `request_id` 只往返一次、对端重放复用同一 grant、撤销后重放同一创建键不复活会话、推送版本严格高于对端返回版本、版本下限只增不减、策略/配额先于对端往返拒绝、入站 create 仍本地惰性铸造、入站键不得占用出站命名空间、以及 `main.py` 装配把 live provider 接到 `llm_create_session`。首轮红测为前 20 个用例、**20 failed**（`create_peer_session`/`set_session_provider` 尚不存在）；补充命名空间隔离与撤销重放两个回归后 **22 passed（1.13s）**。
+- **当前快照（2026-11-03）**：A 全量单测 **470 passed**（32.32s，含本热修 22 个 peer-first 创建用例）、B **377 passed**（35.03s）、A+B 业务回环 **24 passed**（254.83s）、跨传输 **26 passed**（165.26s）、独立密码学校验 **36/36**；B `tsc -p tsconfig.json --noEmit` exit 0。更早的 394/355、360/348/22 与 295/335、19 PASS / 7 `BLOCKED-IMPL` 记录已经作废，仅存档。真实宿主整机验收仍 `BLOCKED-ENV`；用户环境 4.29.4 未真实运行验收。
 
 ### 安全
 

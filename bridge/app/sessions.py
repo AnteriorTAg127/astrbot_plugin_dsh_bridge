@@ -12,9 +12,11 @@ connection and task so an administrator can reclaim them in one action.
 
 from __future__ import annotations
 
+import asyncio
 import time
 import uuid
 from collections.abc import Awaitable, Callable
+from typing import Any
 
 from astrbot.api import logger
 
@@ -23,19 +25,27 @@ from ..constants import (
     GRANTED_BY_HUMAN,
     KIND_EVT,
     MSG_SESSION_AUTHZ,
+    MSG_SESSION_CREATE,
     SESSION_ACTIONS,
     SESSION_STATES,
 )
 from ..errors import (
     ERR_BAD_PARAMS,
+    ERR_CAPABILITY_UNAVAILABLE,
+    ERR_NOT_READY,
     ERR_SESSION_ARCHIVED,
     ERR_SESSION_CREATE_DENIED,
     ERR_SESSION_NOT_AUTHORIZED,
     ERR_SESSION_QUOTA_EXCEEDED,
     BridgeError,
 )
-from ..session import utc_iso_ms
+from ..session import SessionState, utc_iso_ms
 from ..store import Store
+
+#: Namespace for outbound (agent-facing) create idempotency keys. The same table
+#: also stores ids chosen by the peer for inbound requests, so one direction must
+#: never resolve to a session created by the other.
+_OUTBOUND_CREATE_PREFIX = "outbound:"
 
 
 def _iso(epoch: float | None) -> str | None:
@@ -82,6 +92,21 @@ class SessionService:
         self._allow_agent_create = allow_agent_create
         self._max_agent_sessions = max_agent_sessions
         self._on_authz_changed = on_authz_changed
+        #: Returns the live session, if any. Installed by the composition root so
+        #: agent-facing creation can round-trip with the peer.
+        self._session_provider: Callable[[], Any] | None = None
+        #: Serialises the cache-check -> peer call -> local grant cycle so one
+        #: request key cannot reserve two peer sessions concurrently.
+        self._create_lock = asyncio.Lock()
+
+    def set_session_provider(self, provider: Callable[[], Any] | None) -> None:
+        """Install the callback that returns the current live session.
+
+        Args:
+            provider: Zero-argument callable returning a ready session (or
+                ``None``); ``None`` disables agent-facing creation.
+        """
+        self._session_provider = provider
 
     async def init(self) -> None:
         """Persist the configured creation policy into the store."""
@@ -141,7 +166,14 @@ class SessionService:
         }
 
     async def create_session(self, params: dict) -> dict:
-        """``session.create``: auto-authorize inside the quota (§9.7, PRD §6.4.2).
+        """``session.create`` (inbound only): auto-authorize inside the quota (§9.7).
+
+        This is the handler for a peer request that asks *this* endpoint to create
+        an AstrBot-side session. AstrBot materializes its session on demand, so
+        minting the id here is safe and lazy. It must never serve agent-facing
+        calls: DSH only executes sessions that already exist on its side, so the
+        agent path uses :meth:`create_peer_session` and authorizes only the id the
+        peer returned.
 
         Args:
             params: ``{"request_id", "purpose", "title"}``.
@@ -155,6 +187,11 @@ class SessionService:
         """
         request_id = params.get("request_id")
         if not isinstance(request_id, str) or not request_id:
+            raise BridgeError(ERR_BAD_PARAMS, details={"field": "request_id"})
+        if request_id.startswith(_OUTBOUND_CREATE_PREFIX):
+            # The namespace is reserved for agent-facing keys. A peer key must
+            # never alias one, or a local lazy session could be returned as the
+            # result of an outbound peer create.
             raise BridgeError(ERR_BAD_PARAMS, details={"field": "request_id"})
         snapshot = await self._store.authz_snapshot()
         if not snapshot["allow_agent_create"]:
@@ -215,6 +252,182 @@ class SessionService:
             "granted_by": GRANTED_BY_AGENT_AUTO,
             "authz_version": version,
         }
+
+    async def create_peer_session(self, params: dict) -> dict:
+        """Create a real session on the peer, then authorize its id locally.
+
+        Agent-facing creation must not mint an id: the peer executes a task by
+        resuming an existing peer-side session, so an id invented here makes every
+        later delivery fail with ``session_not_found``. The order is therefore
+        peer-first, local-grant-second: any failure (no live READY session, peer
+        timeout, denial, quota, unexpected carrier error) returns without leaving
+        a local grant.
+
+        ``request_id`` is the idempotency key. A repeated key returns the cached
+        grant without another round trip; if the peer replays its own create for
+        the same key, the returned id reuses the existing grant.
+
+        Args:
+            params: ``{"request_id", "purpose", "title"}``.
+
+        Returns:
+            ``{"session_id", "authorized", "granted_by", "authz_version"}``.
+
+        Raises:
+            BridgeError: ``bad_params`` for a malformed request, ``not_ready``
+                without a live READY session, ``session_create_denied`` /
+                ``session_quota_exceeded`` when local policy refuses, the peer's
+                own error (``timeout``, ``session_create_denied``,
+                ``unknown_message``, ...), or ``capability_unavailable`` for a
+                carrier failure or an unusable reply.
+        """
+        request_id = params.get("request_id")
+        if not isinstance(request_id, str) or not request_id:
+            raise BridgeError(ERR_BAD_PARAMS, details={"field": "request_id"})
+        purpose = params.get("purpose") or ""
+        title = params.get("title") or ""
+        if not isinstance(purpose, str) or not isinstance(title, str):
+            raise BridgeError(ERR_BAD_PARAMS, details={"field": "purpose"})
+
+        async with self._create_lock:
+            # Outbound keys share the table with peer-chosen inbound keys, so the
+            # namespace keeps one direction from resolving the other's session.
+            key = f"{_OUTBOUND_CREATE_PREFIX}{request_id}"
+            existing_id = await self._store.lookup_session_create_request(key)
+            if existing_id:
+                grant = await self._store.get_grant(existing_id)
+                if grant is not None and not grant["revoked"]:
+                    snapshot = await self._store.authz_snapshot()
+                    return {
+                        "session_id": existing_id,
+                        "authorized": True,
+                        "granted_by": grant["granted_by"],
+                        "authz_version": snapshot["version"],
+                    }
+                if grant is not None:
+                    # An explicit admin revoke must not be undone by replaying the
+                    # creation key: fail closed instead of re-granting the session.
+                    logger.warning(
+                        "bridge peer session.create replay refused conn=%s "
+                        "session=%s reason=revoked",
+                        self._conn,
+                        existing_id,
+                    )
+                    raise BridgeError(ERR_SESSION_CREATE_DENIED)
+
+            # Refuse locally before reserving a peer session: a peer session this
+            # endpoint then fails to authorize would be an orphan.
+            snapshot = await self._store.authz_snapshot()
+            if not snapshot["allow_agent_create"]:
+                logger.warning(
+                    "bridge peer session.create denied conn=%s reason=policy_disabled",
+                    self._conn,
+                )
+                raise BridgeError(ERR_SESSION_CREATE_DENIED)
+            used = sum(
+                1
+                for grant in snapshot["grants"]
+                if grant["granted_by"] == GRANTED_BY_AGENT_AUTO
+            )
+            if used >= snapshot["max_agent_sessions"]:
+                logger.warning(
+                    "bridge peer session.create rejected conn=%s reason=quota_exceeded",
+                    self._conn,
+                )
+                raise BridgeError(ERR_SESSION_QUOTA_EXCEEDED)
+
+            session = self._session_provider() if self._session_provider else None
+            state = getattr(session, "state", None)
+            if session is None or state is not SessionState.READY:
+                logger.warning(
+                    "bridge peer session.create refused conn=%s reason=no_ready_session",
+                    self._conn,
+                )
+                raise BridgeError(ERR_NOT_READY, details={"reason": "no_ready_session"})
+
+            try:
+                result = await session.call(
+                    MSG_SESSION_CREATE,
+                    {"request_id": request_id, "purpose": purpose, "title": title},
+                )
+            except asyncio.CancelledError:
+                raise
+            except BridgeError:
+                # A refusal or timeout is already the honest answer: nothing local
+                # has been written and the peer error code stays visible.
+                raise
+            except Exception as exc:
+                logger.exception(
+                    "bridge peer session.create failed conn=%s request=%s",
+                    self._conn,
+                    request_id,
+                )
+                raise BridgeError(
+                    ERR_CAPABILITY_UNAVAILABLE,
+                    details={"reason": "session_create_failed"},
+                ) from exc
+
+            peer_session_id = (
+                result.get("session_id") if isinstance(result, dict) else None
+            )
+            peer_version = (
+                result.get("authz_version") if isinstance(result, dict) else None
+            )
+            if not isinstance(peer_session_id, str) or not peer_session_id:
+                logger.error(
+                    "bridge peer session.create reply has no session_id conn=%s "
+                    "request=%s",
+                    self._conn,
+                    request_id,
+                )
+                raise BridgeError(
+                    ERR_CAPABILITY_UNAVAILABLE,
+                    details={"reason": "missing_session_id"},
+                )
+            if not isinstance(peer_version, int) or isinstance(peer_version, bool):
+                logger.error(
+                    "bridge peer session.create reply has no authz_version conn=%s "
+                    "request=%s",
+                    self._conn,
+                    request_id,
+                )
+                raise BridgeError(
+                    ERR_CAPABILITY_UNAVAILABLE,
+                    details={"reason": "missing_authz_version"},
+                )
+
+            # B bumps its cached version inside its own create and then ignores any
+            # push whose version is not strictly higher. Adopt the returned floor
+            # before the local grant bump, otherwise this endpoint's authoritative
+            # push (including later revokes) could be discarded as stale.
+            await self._store.raise_authz_version_floor(peer_version)
+            await self._store.record_session_create_request(key, peer_session_id)
+            version = await self._store.grant_session(
+                {
+                    "session_id": peer_session_id,
+                    "purpose": purpose,
+                    "title": title,
+                    "state": "idle",
+                    "granted_by": GRANTED_BY_AGENT_AUTO,
+                    "granted_by_id": f"conn:{self._conn}#request:{request_id}",
+                    "created_by_task": params.get("task_id"),
+                }
+            )
+            await self._push_authz()
+            logger.info(
+                "bridge peer session authorized conn=%s session=%s request=%s "
+                "version=%s",
+                self._conn,
+                peer_session_id,
+                request_id,
+                version,
+            )
+            return {
+                "session_id": peer_session_id,
+                "authorized": True,
+                "granted_by": GRANTED_BY_AGENT_AUTO,
+                "authz_version": version,
+            }
 
     async def select_session(self, params: dict) -> dict:
         """``session.select``: validate an authorized session for a task (§9.7).

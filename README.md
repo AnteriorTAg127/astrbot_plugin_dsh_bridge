@@ -12,7 +12,7 @@
 > 协议主本 `开发/v0.1/protocol.md` 属于**内部开发工作记录，不随公开仓库/交付包发布**；
 > 公开可复核的金标准向量是本仓库 [`tests/fixtures/protocol_vectors_v1.json`](tests/fixtures/protocol_vectors_v1.json)。
 
-**版本状态**：插件 `v0.1.0`（`metadata.yaml` 的 `astrbot_version` 为 `>=4.16,<5`）。对端 DSH 侧插件同为 `0.1.0`，面向 `@deepseek-ai/dsh` **`0.2.1-rc.2`**。本地测试环境为 **AstrBot 4.29.3 / Python 3.12.16**；用户环境报告为 **4.29.4**，本轮未在 4.29.4 上真实运行验收，只有本机 4.29.3 的宿主契约测试与用户截图所示契约一致，不能据此宣称 4.29.4 已通过。其余 AstrBot 版本均未实测。主要功能已实现，但仍有待真实环境验证项（见文末「已知限制与未验证项」）；**当前快照（2026-11-02）**：A 全量单测 **448 passed**、B **377 passed**、A+B 真实 socket 业务回环 **24 passed**、跨传输 **26 passed**、独立密码学校验 **36/36**，B `tsc -p tsconfig.json --noEmit` 通过。**真实 AstrBot 宿主内的整机联调、真实 OpenAPI/SSE 流、真实 IM 平台、真实 LLM 多模态判定与 TLS 均未验证（BLOCKED-ENV）**。部署前请先读文末「测试现状」与「已知限制与未验证项」。用户命令统一写成**单行 PowerShell**；`tests/integration/` 中的跨传输 harness 仅支持 POSIX（依赖 `/proc` 与进程组信号），Windows 原生环境不宣称跑通含 integration 的全量，请改用 WSL 执行（命令仍为单行 PowerShell，见「开发」）。
+**版本状态**：插件 `v0.1.0`（`metadata.yaml` 的 `astrbot_version` 为 `>=4.16,<5`）。对端 DSH 侧插件同为 `0.1.0`，面向 `@deepseek-ai/dsh` **`0.2.1-rc.2`**。本地测试环境为 **AstrBot 4.29.3 / Python 3.12.16**；用户环境报告为 **4.29.4**，本轮未在 4.29.4 上真实运行验收，只有本机 4.29.3 的宿主契约测试与用户截图所示契约一致，不能据此宣称 4.29.4 已通过。其余 AstrBot 版本均未实测。主要功能已实现，但仍有待真实环境验证项（见文末「已知限制与未验证项」）；**当前快照（2026-11-03）**：A 全量单测 **470 passed**、B **377 passed**、A+B 真实 socket 业务回环 **24 passed**、跨传输 **26 passed**、独立密码学校验 **36/36**，B `tsc -p tsconfig.json --noEmit` 通过。**真实 AstrBot 宿主内的整机联调、真实 OpenAPI/SSE 流、真实 IM 平台、真实 LLM 多模态判定与 TLS 均未验证（BLOCKED-ENV）**。部署前请先读文末「测试现状」与「已知限制与未验证项」。用户命令统一写成**单行 PowerShell**；`tests/integration/` 中的跨传输 harness 仅支持 POSIX（依赖 `/proc` 与进程组信号），Windows 原生环境不宣称跑通含 integration 的全量，请改用 WSL 执行（命令仍为单行 PowerShell，见「开发」）。
 
 ## 功能
 
@@ -20,7 +20,7 @@
 - **对等双向任务**：A→B 与 B→A 完全对称；提交**立即返回** `accepted` / `pending_approval` + `task_id`，结果异步回传。
 - **持久化与幂等**：任务、事件、审批、授权、唤醒计数存 SQLite（`data/plugin_data/astrbot_plugin_dsh_bridge/bridge.db`），重启不丢。
 - **人工审批与业务决策**：三类审批（业务决策 / 跨端提交 / DSH 原生工具）统一进 A 侧待审批队列；**A 侧队列内**同一审批首个答复生效。DSH 原生审批采用 B 侧 claim-or-hand-back，本地 UI 与远端人类并不会同时对同一请求作答——这与原始需求「双方都能答、先答者胜」**不等价**，该竞争语义仍未实现（见「已知限制与未验证项」）。
-- **会话授权治理**：A 侧是授权权威；Agent 在后台授予的**创建配额**内创建会话即自动授权（带审计标记），超配额拒绝；归档会话在 `task.submit` 处按 `session_archived` 拒绝，自动唤醒投递也会跳过归档会话（不再消耗唤醒链/限速预算）。会话列表与管理员列表输出**完整 UUID**；选择只接受完整 UUID，不支持前缀、不自动选第一个；`dsh_select_session` 当前只做授权校验，不绑定/不切换任务，也不改写已批准内容。
+- **会话授权治理**：A 侧是授权权威；**Agent 创建会话会先在活动连接上向对端 `session.create` 预约真实会话，只授权对端返回的 id**（不再本机凭空铸造 UUID）；没有 READY 连接、对端超时/拒绝/超配额时创建失败且**不产生本地授权**。成功后在后台授予的**创建配额**内自动授权（带审计标记），超配额拒绝；归档会话在 `task.submit` 处按 `session_archived` 拒绝，自动唤醒投递也会跳过归档会话（不再消耗唤醒链/限速预算）。会话列表与管理员列表输出**完整 UUID**；选择只接受完整 UUID，不支持前缀、不自动选第一个；`dsh_select_session` 当前只做授权校验，不绑定/不切换任务，也不改写已批准内容。
 - **图片输入**：仅任务显式附件，四类 MIME、字节/张数/像素受限，魔数校验；**绝不**抓取任意外部 URL 或聊天历史图片。
 - **中文后台页**：连接状态、会话授权、任务进度、审批四块，**不显示任何密钥**。
 
@@ -55,7 +55,7 @@
 | `conn_tls_cert_path` / `conn_tls_key_path` | `""` | 仅 listen 侧需要的证书与私钥路径 |
 | `conn_tls_fingerprint` | `""` | 对端证书 SHA-256 指纹；填了就强制校验，不匹配即拒绝 |
 | `conn_psk_id` / `conn_psk_secret` | `""` | 预共享密钥。**两端一致**；留空则该连接拒绝建立（不会退化为明文） |
-| `conn_allow_agent_create` | `true` | 是否允许 Agent 自动创建会话（配额内自动授权） |
+| `conn_allow_agent_create` | `true` | 是否允许 Agent 在对端创建真实会话（配额内自动授权；无活动连接时直接失败） |
 | `conn_max_agent_sessions` | `10` | Agent 自动创建会话的数量上限，达到即拒绝，不自动扩容 |
 
 > `_conf_schema.json` 里 `conn_host`/`conn_port` 的 hint 仍写着“listen 侧填本机绑定地址”，那是旧描述；实际行为以本表为准——两种 mode 的 `conn_host`/`conn_port` 都填**对端**，本端入口只看 `conn_bind_addr`/`conn_bind_port`。本次只校正了 `dashboard_enabled` 的说明，未改这两项 hint。
@@ -159,12 +159,17 @@ A 侧已经把「本端监听」与「对端地址」拆成两组字段（`conn_
 | `dsh_submit_task` | 提交跨端任务，立即返回 `task_id`（**不会**同步等结果；必须显式传完整 `session_id`） |
 | `dsh_task_status` | 幂等查询任务状态 |
 | `dsh_list_sessions` | 列授权范围内的会话（含用途；输出完整 UUID） |
-| `dsh_create_session` | 在配额内创建会话（自动授权） |
+| `dsh_create_session` | 在活动连接上让对端创建真实会话，成功后在本端自动授权（失败不产生授权） |
 | `dsh_select_session` | 校验授权会话（**只校验，不绑定/不切换任务**） |
 
 > **会话 ID 不截断、不接受前缀**：`dsh_list_sessions` 与 `/dsh sessions` 都输出完整 UUID；`dsh_select_session`
 > 只接受授权范围内的完整 UUID，不会把 8 位前缀解析成会话、不会自动选第一个、不会放宽授权。
 > `dsh_select_session` 当前是只读授权检查：它不修改 pending 任务，也不改变已批准内容（任务/审批摘要在人工批准前已落盘）。
+
+> **`dsh_create_session` 需要活动连接**：它先在对端创建真实会话，成功后才在本端授权对方返回的 id。
+> 无 READY 连接、对端超时、`session_create_denied`、`session_quota_exceeded`、`unknown_message` 等任何失败都会直接返回，
+> **不会本机铸造 UUID，也不会留下授权**。因此“创建成功”意味着对端确实存在该会话，不会再出现本端已授权、对端
+> `session_not_found` 的幽灵会话。
 
 > 这五个适配器是真正的 `FunctionTool` 子类：`handler` 指向实例的 `__call__`，`handler_module_path` 由宿主的 `Context.add_llm_tools` 在注册时写入。因此它们能通过宿主的 `_PermissionGuardedTool` 权限包装与 `FunctionToolExecutor`；恢复为裸类或仅加 `handler` 属性都会在宿主执行时触发 `AttributeError: ... has no attribute 'handler'`。热修同时覆盖“停用（保留工具行）→启用”、卸载按模块路径移除，以及 `initialize` 局部失败后的资源回收。该结论只在本地 AstrBot **4.29.3** 的宿主契约测试中验证，不代表用户报告的 4.29.4 已完成真实运行验收。
 
@@ -207,6 +212,7 @@ AstrBot 插件详情页 → 打开「bridge」视图。包含四块：
 | 配了 `connections` 但只有第一条生效 | 当前版本只为**第一条**连接建立会话，其余条目被忽略（多连接尚未接线） |
 | Webhook 握手成功、随后探测失败 | 不是“预期不可用”：检查两端 `conn_bind_addr`/`conn_bind_port` 是否为对端可达的显式端点、`conn_host`/`conn_port` 是否填对端、防火墙是否放行；状态页会记录回退历史与 `carrier_degraded` |
 | 任务不执行、日志提示 openapi | `openapi_api_key` / `openapi_key_id` 未配置或归属自检失败 |
+| 任务失败 `session_not_found` | 该会话在 DSH 侧不存在。可能是升级前 `dsh_create_session` 留下的幽灵授权（旧版本只在本机铸造 UUID）。先 `dsh_list_sessions` 核对，在后台撤销该旧授权，再用 `dsh_create_session` 重新创建；新版本会先让对端真实建会话，失败则不产生授权。 |
 | 审批页按钮不可点 | 未以 Dashboard 身份登录；插件作用域 API Key 无审批权 |
 
 > 日志与代码注释为英文，界面文案为中文；日志中不会出现 PSK 或 API Key。
@@ -223,7 +229,8 @@ AstrBot 插件详情页 → 打开「bridge」视图。包含四块：
 - **宿主边界已接线，但真实宿主验收未完成**：宿主适配层与 `main.py` 的接线已由单测、业务回环与跨传输用例覆盖；真实 AstrBot/DSH 进程内的整机验收仍以 `BLOCKED-ENV` 记录，不能据此宣称生产可用。
 - **LLM 工具热修只覆盖已确认缺陷**：已修复五个裸类缺少 `FunctionTool.handler` 导致的宿主执行/重载失败，以及 `initialize` 在 `Store.init` 之后失败时未 `terminate` 的资源泄漏；没有用户失败日志，因此**不能声称所有间歇性 reload 问题都已解决**。宿主契约验证使用本机 AstrBot 4.29.3，用户报告的 4.29.4 未真实运行验收；用户截图只能说明契约一致，不能替代 4.29.4 的运行验收。
 - **原生审批的“先答者胜”未实现**：原始需求要求本地 UI 与远端人类都能作答、先答者胜；B 侧实际采用 claim-or-hand-back（本地或远端二选一），与“先回答者竞争”**不等价**，该需求仍未满足。
-- **类型与验收**：没有独立的类型检查门禁；历史跨端快照里的 19 PASS / 7 `BLOCKED-IMPL` 与更早的 295/335 条数字均已过时，只作存档。当前快照为 A 442 / B 377 / business 24 / cross 26 / crypto 36/36（2026-11-02），B `tsc --noEmit` 通过，真实宿主稳定验收仍 `BLOCKED-ENV`。
+- **Agent 创建改为“对端先建、本端后授权”**：这是对幽灵会话（本端授权一个对端从未创建的 id，任务执行时 `session_not_found`）的修复。它需要活动连接；失败不产生本地授权。两点仍属边界：升级前旧代码留下的授权行不会被自动清理，需管理员在状态页撤销；若对端已创建成功而本端在写授权前崩溃，对端可能留下未被本端授权的孤儿会话（不会被误用，但需人工清理）。该修复仅经本机单测，未在真实宿主/真实网络验收。
+- **类型与验收**：没有独立的类型检查门禁；历史跨端快照里的 19 PASS / 7 `BLOCKED-IMPL` 与更早的 295/335 条数字均已过时，只作存档。当前快照为 A 470 / B 377 / business 24 / cross 26 / crypto 36/36（2026-11-03），B `tsc --noEmit` 通过，真实宿主稳定验收仍 `BLOCKED-ENV`。
 - **降级回退**：`TransportManager.carrier_degraded()` → `_switch_to_fallback()` 已真实接线，回环用例有通过记录；但真实跨机 Webhook 探测失败后的回退仍未在真实网络验证，不能据此宣称生产可用。
 - 双方都不可达（双 NAT、无公网入口、无隧道）时无法连通，插件只给出可读诊断，不无限重试。
 - 首版仅支持图片，不做一般文件/音频/视频传输。
@@ -287,7 +294,7 @@ Set-Location <你的 AstrBot 目录>; uv run pytest data\plugins\astrbot_plugin_
 
 ### 测试现状（历史快照，不等于当前验收）
 
-- **2026-11-02 当前快照**：A 全量单测 448 passed（32.11s，含 15 个真实宿主契约用例与本热修 6 个会话 ID 完整性用例）；B 全量单测 377 passed / 0 failed（35.03s）；A+B 真实 socket 业务回环 24 passed（254.83s）；跨传输 26 passed（165.26s）；独立密码学校验 36/36 passed；B `tsc -p tsconfig.json --noEmit` exit 0。命令与分项见 `开发/changelog.md`、`开发/v0.1/test/llm-tool-host-contract-hotfix.md`、`开发/v0.1/test/session-id-integrity-hotfix.md`、`开发/v0.1/test/business-roundtrip-results.md`、`开发/v0.1/test/approval-lookup-results.md`。
+- **2026-11-03 当前快照**：A 全量单测 470 passed（32.32s，含 22 个本机 peer-first 创建用例）；B 全量单测 377 passed / 0 failed（35.03s，2026-11-02 快照）；A+B 真实 socket 业务回环 24 passed（254.83s）；跨传输 26 passed（165.26s）；独立密码学校验 36/36 passed；B `tsc -p tsconfig.json --noEmit` exit 0。命令与分项见 `开发/changelog.md`、`开发/v0.1/test/peer-session-creation-fix.md`、`开发/v0.1/test/llm-tool-host-contract-hotfix.md`、`开发/v0.1/test/session-id-integrity-hotfix.md`、`开发/v0.1/test/business-roundtrip-results.md`、`开发/v0.1/test/approval-lookup-results.md`。
 - **更早的数字已作废**：A 360 / B 348 / business 22（17:35）、295/335、19 PASS / 7 `BLOCKED-IMPL` 等快照均已被取代，只作存档。
 - **静态检查**：`ruff format .` 与 `ruff check .` 对整个插件目录通过；B 的 `node --check` 全树通过，`tsc -p tsconfig.json --noEmit` exit 0。
 - **仍为 `BLOCKED-ENV`**：真实 AstrBot/DSH 宿主、真实 IM/OpenAPI SSE/TLS 未验证；竞争审批（两侧先答者胜）与 native approval id 竞争偏差仍是未满足项。

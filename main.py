@@ -432,6 +432,9 @@ class DshBridgePlugin(Star):
             # Releasing a held outbound submission must use the session that is live
             # at that moment; a stale/absent link parks the task instead of sending.
             self._tasks.set_session_provider(lambda: self._session)
+            # Agent-facing creation must reserve a real peer session: DSH resumes
+            # existing sessions, so an id minted here would never execute.
+            self._sessions_svc.set_session_provider(lambda: self._session)
 
             self._router = Router(self._store, conn=self._conn_id())
             self._tasks.register(self._router)
@@ -1969,7 +1972,11 @@ class DshBridgePlugin(Star):
     async def llm_create_session(
         self, event: AstrMessageEvent, purpose: str, title: str = ""
     ) -> str:
-        """Create a session inside the granted quota (auto-authorized).
+        """Create a real session on the peer, then authorize it (auto).
+
+        Agent-facing creation needs a live connection: the peer creates the
+        session first and only the id it returns is authorized here, so a
+        disconnected bridge fails instead of leaving a phantom grant.
 
         Args:
             event: Incoming message event.
@@ -1982,12 +1989,15 @@ class DshBridgePlugin(Star):
         if self._sessions_svc is None:
             return "桥接尚未就绪。"
         try:
-            result = await self._sessions_svc.create_session(
+            result = await self._sessions_svc.create_peer_session(
                 {"request_id": str(uuid.uuid4()), "purpose": purpose, "title": title}
             )
         except BridgeError as exc:
-            return f"创建会话失败：{exc.code}"
-        return f"会话已创建并授权：{result['session_id']}（用途：{purpose}）"
+            return (
+                f"创建会话失败：{exc.code}（未在本机铸造会话，也未产生授权；"
+                "需要与对端建立活动连接）"
+            )
+        return f"已在连接对端创建并授权会话：{result['session_id']}（用途：{purpose}）"
 
     async def llm_select_session(
         self, event: AstrMessageEvent, task_id: str, session_id: str
@@ -2442,12 +2452,15 @@ class DshListSessionsTool(_DshLlmTool):
 
 
 class DshCreateSessionTool(_DshLlmTool):
-    """LLM tool ``dsh_create_session``: create a session inside the granted quota."""
+    """LLM tool ``dsh_create_session``: create and authorize a real peer session."""
 
     name = "dsh_create_session"
     description = (
-        "Create a new session for a purpose. Inside the administrator-granted quota the "
-        "new session is authorized automatically; above the quota creation is refused."
+        "Create a real session on the connected peer and authorize it here. This "
+        "requires a live connection and round-trips with the peer first; without one "
+        "it fails and creates no authorization. Inside the administrator-granted "
+        "quota the peer session is authorized automatically; above the quota or when "
+        "the peer refuses, creation fails closed."
     )
     parameters = {
         "type": "object",
