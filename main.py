@@ -54,6 +54,7 @@ from .bridge.constants import (
 from .bridge.crypto import handshake_key, mac_object, psk_master
 from .bridge.errors import (
     ERR_APPROVAL_LOOKUP_FAILED,
+    ERR_CAPABILITY_UNAVAILABLE,
     ERR_NOT_READY,
     ERR_PSK_NOT_CONFIGURED,
     BridgeError,
@@ -1314,6 +1315,10 @@ class DshBridgePlugin(Star):
     async def _push_authz(self, snapshot: dict) -> None:
         """Push ``session.authz`` whenever the authorization table changes (§9.7).
 
+        Background path: a failed push is logged and retried by the next table
+        change. Callers that must report the outcome use
+        :meth:`_push_authz_strict`.
+
         Args:
             snapshot: New snapshot.
         """
@@ -1323,6 +1328,20 @@ class DshBridgePlugin(Star):
             await self._session.send_message(await self._sessions_svc.authz_message())
         except Exception:
             logger.warning("bridge session.authz push deferred (session not ready)")
+
+    async def _push_authz_strict(self) -> None:
+        """Push ``session.authz`` and propagate any failure to the caller.
+
+        The audit ``fix`` must not report success when the peer never received
+        the snapshot, so this variant never swallows an exception.
+
+        Raises:
+            BridgeError: ``not_ready`` when no live session is available.
+            Exception: The transport/session error from the send itself.
+        """
+        if self._sessions_svc is None or self._session is None:
+            raise BridgeError(ERR_NOT_READY, details={"reason": "no_push_callback"})
+        await self._session.send_message(await self._sessions_svc.authz_message())
 
     # -- handler registration ----------------------------------------------------------
 
@@ -1628,8 +1647,9 @@ class DshBridgePlugin(Star):
         yield event.plain_result(
             "DSH 桥接指令：\n"
             "/dsh status — 连接与传输概况\n"
-            "/dsh tasks [n] — 最近任务（双向标注）\n"
+            "/dsh tasks [n] — 最近任务（双向标注，完整 task_id）\n"
             "/dsh sessions — 会话与授权概览\n"
+            "/dsh sessions check [fix] — 与对端授权表对账；fix 重推权威快照\n"
             "/dsh approve <审批号> — 批准一次（仅人可批）\n"
             "/dsh reject <审批号> [理由] — 拒绝\n"
             "任务提交与查询请通过 LLM 工具 dsh_submit_task / dsh_task_status 完成。"
@@ -1685,27 +1705,47 @@ class DshBridgePlugin(Star):
         if not tasks:
             yield event.plain_result("暂无任务。")
             return
-        lines = ["【最近任务】"]
+        lines = [
+            "【最近任务】",
+            "任务 ID 为完整 UUID，可直接用于 dsh_task_status / dsh_select_session。",
+        ]
         for task in tasks:
             direction = "→" if task["direction"] == DIRECTION_OUTBOUND else "←"
             lines.append(
-                f"{direction} {task['task_id'][:8]} {task['status']} "
+                f"{direction} {task['task_id']} {task['status']} "
                 f"{task.get('purpose') or '-'}"
             )
         yield event.plain_result("\n".join(lines))
 
     @dsh.command("sessions")
-    async def dsh_sessions(self, event: AstrMessageEvent):
-        """显示会话授权概览（仅管理员）。
+    async def dsh_sessions(
+        self, event: AstrMessageEvent, mode: str = "", extra: str = ""
+    ):
+        """显示会话授权概览，或执行授权体检（仅管理员）。
+
+        ``/dsh sessions`` 列出授权表；``/dsh sessions check`` 与对端
+        ``session.list`` 对账；``/dsh sessions check fix`` 先重推权威快照再复查。
 
         Args:
             event: Incoming message event.
+            mode: Optional sub-command, currently only ``check``.
+            extra: Optional ``fix`` after ``check``.
         """
         if not self._is_admin(event):
             yield event.plain_result("该指令仅管理员可用。")
             return
         if self._sessions_svc is None:
             yield event.plain_result("桥接尚未初始化。")
+            return
+        command = (mode or "").strip().lower()
+        if command == "check":
+            report_text = await self._sessions_check(
+                fix=(extra or "").strip().lower() == "fix"
+            )
+            yield event.plain_result(report_text)
+            return
+        if command:
+            yield event.plain_result("用法：/dsh sessions 或 /dsh sessions check [fix]")
             return
         grants = await self._sessions_svc.admin_grants()
         quota = await self._sessions_svc.admin_quota()
@@ -1722,11 +1762,102 @@ class DshBridgePlugin(Star):
         ]
         for grant in grants[:20]:
             state = "已撤销" if grant["revoked"] else "有效"
-            lines.append(
+            line = (
                 f"{grant['session_id']} {state} 用途={grant['purpose'] or '-'} "
                 f"来源={grant['granted_by']}"
             )
+            lines.append(line)
         yield event.plain_result("\n".join(lines))
+
+    async def _sessions_check(self, *, fix: bool) -> str:
+        """Run ``/dsh sessions check [fix]`` and explain the honest limits.
+
+        ``session.list`` reflects the peer's authorization table and activity
+        state only; it cannot prove a DSH-side session exists (``state=cold``
+        means no active agent, not a missing session) and it carries no instance
+        field, so the instance is not compared. The audit therefore never
+        guesses, never adds or deletes grants, and only ``fix`` re-pushes the
+        authoritative snapshot.
+
+        ``fix`` runs entirely inside the service's creation lock, raises the
+        local version to ``max(local, peer) + 1`` (the peer's own
+        ``session.create`` also raises its cached version, so a plain ``+1`` can
+        still be stale) and uses the strict push path so a send failure is
+        reported instead of hidden.
+
+        Args:
+            fix: Whether to raise the version, re-push and audit again.
+
+        Returns:
+            The Chinese report text.
+        """
+        if self._sessions_svc is None or self._store is None:
+            return "桥接尚未初始化。"
+        pushed = False
+        try:
+            if fix:
+                async with self._sessions_svc.create_lock():
+                    report = await self._sessions_svc.peer_audit()
+                    peer_version = report.get("peer_authz_version")
+                    target = report["local_version"]
+                    if isinstance(peer_version, int) and not isinstance(
+                        peer_version, bool
+                    ):
+                        target = max(target, peer_version)
+                    await self._store.raise_authz_version_floor(target + 1)
+                    try:
+                        await self._push_authz_strict()
+                    except Exception:
+                        logger.exception("bridge session.authz fix push failed")
+                        return (
+                            "无法体检：推送失败（session.authz 未发出），"
+                            "本地版本可能已抬高，对端未确认收到。"
+                        )
+                    pushed = True
+                    report = {**report, "after": await self._sessions_svc.peer_audit()}
+            else:
+                report = await self._sessions_svc.peer_audit()
+        except BridgeError as exc:
+            if pushed:
+                return (
+                    f"体检失败：快照已重推，但复检失败（{exc.code}），"
+                    "对端可能已收到，请稍后重新体检。"
+                )
+            if exc.code == ERR_NOT_READY:
+                return (
+                    "无法体检：需要活动连接（当前没有 READY 会话），"
+                    "未发送任何请求，也未做任何修改。"
+                )
+            if exc.code == ERR_CAPABILITY_UNAVAILABLE:
+                return "无法体检：对端未响应或返回了无法解析的会话列表，未做任何修改。"
+            return f"体检失败：{exc.code}（对端错误原样透传，未做任何修改）。"
+
+        blocks = [("体检结果", report)]
+        if "after" in report:
+            blocks.append(("重新推送后", report["after"]))
+        lines = ["【会话授权体检】"]
+        for title, block in blocks:
+            lines.append(f"—— {title} ——")
+            lines.append(
+                f"本地权威：version={block['local_version']}，"
+                f"instance={block['local_instance_id']}（本端）"
+            )
+            lines.append(f"对端缓存：authz_version={block['peer_authz_version']}")
+            lines.append(f"一致：{len(block['both'])} 条")
+            lines.append(
+                f"仅本端有（对端尚未收到）：{', '.join(block['only_local']) or '无'}"
+            )
+            lines.append(
+                f"仅对端有（对端陈旧残留）：{', '.join(block['only_peer']) or '无'}"
+            )
+        lines.append(
+            "说明：session.list 没有实例字段，因此体检不比对实例是否一致。"
+            "它只反映对端授权表与活动状态，"
+            "不能证明 DSH 侧会话真实存在；state=cold 不代表该会话不存在。"
+            "本命令只读对账，fix 仅把本地版本抬到 max(本地, 对端)+1 后重推权威快照，"
+            "不删除/新增授权、不改任务。"
+        )
+        return "\n".join(lines)
 
     @dsh.command("approve")
     async def dsh_approve(self, event: AstrMessageEvent, approval_id: str = ""):

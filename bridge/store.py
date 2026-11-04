@@ -13,6 +13,7 @@ from __future__ import annotations
 import json
 import math
 import time
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -179,7 +180,9 @@ CREATE TABLE IF NOT EXISTS authz_meta (
     id                 INTEGER PRIMARY KEY CHECK (id = 1),
     version            INTEGER NOT NULL DEFAULT 0,
     allow_agent_create INTEGER NOT NULL DEFAULT 1,
-    max_agent_sessions INTEGER NOT NULL DEFAULT 10
+    max_agent_sessions INTEGER NOT NULL DEFAULT 10,
+    instance_id        TEXT,
+    instance_started_at INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS session_create_requests (
@@ -285,9 +288,23 @@ class Store:
         # empty. The verifier treats an empty ``submit_digest`` as "no evidence"
         # and refuses the row instead of falling back to a self-computed digest.
         await self._ensure_approval_evidence_columns()
+        await self._ensure_authz_instance_columns()
         await self._db.execute(
             "INSERT OR IGNORE INTO authz_meta (id, version, allow_agent_create,"
             " max_agent_sessions) VALUES (1, 0, 1, 10)"
+        )
+        # The authority instance identity identifies this database across restarts
+        # (§9.7.1). Both values are generated once, in a single statement, and only
+        # when missing, so rebuilding the file yields a new instance while
+        # reopening the same file keeps the original one. ``instance_started_at``
+        # is what lets the peer order two instances; an empty id is treated as
+        # missing, matching the v0.1 upgrade path.
+        await self._db.execute(
+            "UPDATE authz_meta SET"
+            " instance_id = COALESCE(NULLIF(instance_id, ''), ?),"
+            " instance_started_at = COALESCE(instance_started_at, ?)"
+            " WHERE id = 1",
+            (str(uuid.uuid4()), int(time.time())),
         )
         await self._db.execute(
             "INSERT OR REPLACE INTO meta (key, value) VALUES ('schema_version', ?)",
@@ -332,6 +349,24 @@ class Store:
         ):
             if name not in columns:
                 await db.execute(ddl)
+        await db.commit()
+
+    async def _ensure_authz_instance_columns(self) -> None:
+        """Add the ``authz_meta`` instance columns to a database created before them.
+
+        SQLite has no ``ADD COLUMN IF NOT EXISTS``, so ``PRAGMA table_info`` is
+        read first. The migration only adds the nullable columns; :meth:`init`
+        fills them afterwards, which keeps existing versions, grants and revokes.
+        """
+        db = self._conn()
+        async with db.execute("PRAGMA table_info(authz_meta)") as cursor:
+            columns = {str(row["name"]) for row in await cursor.fetchall()}
+        if "instance_id" not in columns:
+            await db.execute("ALTER TABLE authz_meta ADD COLUMN instance_id TEXT")
+        if "instance_started_at" not in columns:
+            await db.execute(
+                "ALTER TABLE authz_meta ADD COLUMN instance_started_at INTEGER"
+            )
         await db.commit()
 
     async def close(self) -> None:
@@ -1624,28 +1659,58 @@ class Store:
     async def authz_snapshot(self) -> dict:
         """Return the authoritative authorization table (§9.7).
 
+        The three reads (meta, grants, revoked) run inside one transaction so a
+        concurrent grant/revoke can never yield a version from one state and a
+        grant list from another. ``BEGIN IMMEDIATE`` takes the write lock before
+        the first read; when an implicit write transaction is already open on the
+        same connection, the reads join it and its owner still commits.
+
         Returns:
-            ``{"version", "grants", "revoked", "allow_agent_create",
-            "max_agent_sessions"}``.
+            ``{"version", "instance_id", "instance_started_at", "grants",
+            "revoked", "allow_agent_create", "max_agent_sessions"}``.
         """
         db = self._conn()
-        async with db.execute("SELECT * FROM authz_meta WHERE id = 1") as cursor:
-            meta = await cursor.fetchone()
-        async with db.execute(
-            "SELECT * FROM session_grants WHERE revoked = 0 ORDER BY created_at ASC"
-        ) as cursor:
-            rows = await cursor.fetchall()
-        async with db.execute(
-            "SELECT session_id FROM session_grants WHERE revoked = 1"
-        ) as cursor:
-            revoked_rows = await cursor.fetchall()
+        started = not db.in_transaction
+        if started:
+            await db.execute("BEGIN IMMEDIATE")
+        try:
+            async with db.execute("SELECT * FROM authz_meta WHERE id = 1") as cursor:
+                meta = await cursor.fetchone()
+            async with db.execute(
+                "SELECT * FROM session_grants WHERE revoked = 0 ORDER BY created_at ASC"
+            ) as cursor:
+                rows = await cursor.fetchall()
+            async with db.execute(
+                "SELECT session_id FROM session_grants WHERE revoked = 1"
+            ) as cursor:
+                revoked_rows = await cursor.fetchall()
+        finally:
+            if started:
+                await db.commit()
         return {
             "version": int(meta["version"]) if meta is not None else 0,
+            "instance_id": (meta["instance_id"] or None) if meta is not None else None,
+            "instance_started_at": (
+                int(meta["instance_started_at"])
+                if meta is not None and meta["instance_started_at"] is not None
+                else None
+            ),
             "grants": [_grant_payload(row) for row in rows],
             "revoked": [row["session_id"] for row in revoked_rows],
             "allow_agent_create": bool(meta["allow_agent_create"]) if meta else True,
             "max_agent_sessions": int(meta["max_agent_sessions"]) if meta else 10,
         }
+
+    async def bump_authz_version(self) -> int:
+        """Increment and persist the authorization version (§9.7).
+
+        Exposed for callers that must force a strictly higher version before
+        re-sending the authoritative snapshot, for example the audit ``fix``.
+
+        Returns:
+            The new monotonically increasing version.
+        """
+        return await self._bump_authz_version()
 
     async def _bump_authz_version(self) -> int:
         """Increment and persist the authorization version.
@@ -1743,7 +1808,8 @@ class Store:
                 purpose = excluded.purpose, title = excluded.title,
                 granted_by = excluded.granted_by,
                 granted_by_id = excluded.granted_by_id,
-                expires_at = excluded.expires_at, revoked = 0, updated_at = excluded.updated_at
+                expires_at = excluded.expires_at, revoked = 0,
+                updated_at = excluded.updated_at
             """,
             (
                 grant["session_id"],

@@ -3,6 +3,35 @@
 本文件面向使用者，记录发布版本的可见变更。
 开发过程记录（每次改动、测试与调试）在 `开发/changelog.md`，不随仓库发布。
 
+## [0.2.0] - 2026-11-04
+
+会话授权一致性与运维闭环（A 端 R1/R2/R4；R3 已移出 v0.2）。`LABEL`、密码学套件、AAD、封帧布局、错误码词表与金标准向量均未改变；数据库只做加列迁移。
+
+### 新增
+
+- **R1 授权权威实例标识**：`authz_meta.instance_id`（UUIDv4）与 `authz_meta.instance_started_at`（Unix 秒，首次建库时间）在同一条 UPDATE 中一次写入；同一数据库重启两者都不变，换库文件两者都变化。`session.authz` 的 `params` 增加**可选** `instance_id` / `instance_started_at` 且 A 始终携带两者，供对端识别“新权威的更低版本”并拒绝旧实例回放。新增 `tests/fixtures/session_authz_v02.json` 作为两端共享的规范化快照，A 侧用例断言线格式的键集合与类型与它一致。任一端缺少这两个字段时行为与 v0.1 完全一致（仍只按版本单调）。
+- **R2 授权体检**：新增管理员指令 `/dsh sessions check [fix]`。在 READY 连接上调用对端 `session.list`（`state=any`、`limit=200`），与本地权威表对账，输出双方一致条数、仅本端有、仅对端有、本地 `version`/`instance_id`（标注「本端」）与对端 `authz_version`。`session.list` 应答没有实例字段，因此体检**不比对实例**。`fix` 在 `_create_lock` 内执行：先体检取对端版本，把本地版本抬到 **`max(本地, 对端) + 1`**（对端 `session.create` 也会抬高它自己的版本，简单 `+1` 仍可能被拒），再用**严格推送**路径重发 `session.authz`（失败抛出并如实报错，不显示成功），最后复检并报告 `after`。无 READY 连接时明确报“无法体检”，**不发送任何请求、无副作用**；对端错误原样透传，传输异常报 `capability_unavailable`。
+- **R4 完整任务 ID**：`/dsh tasks` 输出完整 `task_id`（不再截断为 8 位），表头说明可直接用于 `dsh_task_status` / `dsh_select_session`。
+- 文档与帮助同步：`/dsh help` 增加体检指令，README 更新指令/工具表、会话治理说明与已知限制。
+
+### 兼容与迁移
+
+- 数据库只加列（`authz_meta.instance_id`、`authz_meta.instance_started_at`），可从 v0.1 数据库直接升级，任务/审批/授权/通知不丢；`session.list`/`session.authz` 语义未变。
+- 无参数 `/dsh sessions` 保持原列表语义；`/dsh tasks` 仅改变 ID 展示，不改变生成、幂等或存储。
+
+### 诚实边界
+
+- **体检不能证明 DSH 侧会话真实存在**：`session.list` 只反映对端授权表与活动状态，且没有实例字段（不比对实例）；`state=cold` 只表示对端没有活动 agent，不代表该会话不存在。体检只读对账，`fix` 只抬版并重推快照，不删除/新增授权。
+- **实例排序依赖 A 主机时钟单调**：对端要求新实例的 `instance_started_at` 严格更大；若 A 重建数据库时系统时钟显著回拨，新实例会被判为更旧而被拒收。这是故障安全方向，需知情接受。
+- **R1 的换实例接受规则生效在对端（B）**：只升级 A 端时，B 仍按 v0.1 的严格版本单调规则处理，A 重建数据库后的推送可能被判 `stale_authz`。本轮 A 侧验证了字段生成、持久化与跨端 fixture 契约，未做真实跨端运行验收。
+- **未在 AstrBot 4.29.4 上真实运行验收**；本版本结论来自本机单测（A 486 passed、B 424 passed，2026-11-04），真实宿主/真实网络仍属 `BLOCKED-ENV`。
+- **同秒重建**：`instance_started_at` 为秒级，同一秒内重建数据库会使新旧实例取值相等，对端按规则 4 拒收新实例（故障安全方向）；需清理对端 `authz/current` 后再推送，根因修复列入 v0.3。
+- **规则 0 可被本地记录丢失重新打开**：B 的 `authz/current` 被删除/损坏后，缓存无身份状态会再次触发一次性升级接受；加固（持久化「曾记录身份」标记）列入 v0.3。
+
+### 测试
+
+- 新增 `tests/test_session_authz_v02.py`（16 个用例），使用真实 `Store`/`SessionService` + 临时 SQLite，仅把活动连接替换为记录型 double。覆盖：同库重启两实例字段不变、新库两者都变化且 version 从 0 起、`snapshot()`/`authz_message()` 携带两字段且键集合/类型等于跨端 fixture、`authz_snapshot()` 同事务读、v0.1 库双列迁移；体检一致/双向差异/过期授权排除/无 READY 会话零请求/对端错误透传与传输异常包装；非管理员 `check`/`fix` 零对端调用；`fix` 对端版本更高时抬到 `peer+1`、严格推送失败如实报错、`fix` 与 `create_peer_session` 并发不丢 grant；同前缀 `task_id` 在 `/dsh tasks` 中可区分。先红 **7 failed, 9 passed（1.71s）**，实现后 **16 passed（1.78s）**，A 全量 **486 passed（34.05s）**，未跑 integration。
+
 ## [0.1.0] - 2026-10-30
 
 首个版本。实现 `dsh-bridge/v1` 协议的 A 端（AstrBot 插件），可与 DSH 侧插件建立受控的对等双向通道。

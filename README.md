@@ -12,7 +12,7 @@
 > 协议主本 `开发/v0.1/protocol.md` 属于**内部开发工作记录，不随公开仓库/交付包发布**；
 > 公开可复核的金标准向量是本仓库 [`tests/fixtures/protocol_vectors_v1.json`](tests/fixtures/protocol_vectors_v1.json)。
 
-**版本状态**：插件 `v0.1.0`（`metadata.yaml` 的 `astrbot_version` 为 `>=4.16,<5`）。对端 DSH 侧插件同为 `0.1.0`，面向 `@deepseek-ai/dsh` **`0.2.1-rc.2`**。本地测试环境为 **AstrBot 4.29.3 / Python 3.12.16**；用户环境报告为 **4.29.4**，本轮未在 4.29.4 上真实运行验收，只有本机 4.29.3 的宿主契约测试与用户截图所示契约一致，不能据此宣称 4.29.4 已通过。其余 AstrBot 版本均未实测。主要功能已实现，但仍有待真实环境验证项（见文末「已知限制与未验证项」）；**当前快照（2026-11-03）**：A 全量单测 **470 passed**、B **377 passed**、A+B 真实 socket 业务回环 **24 passed**、跨传输 **26 passed**、独立密码学校验 **36/36**，B `tsc -p tsconfig.json --noEmit` 通过。**真实 AstrBot 宿主内的整机联调、真实 OpenAPI/SSE 流、真实 IM 平台、真实 LLM 多模态判定与 TLS 均未验证（BLOCKED-ENV）**。部署前请先读文末「测试现状」与「已知限制与未验证项」。用户命令统一写成**单行 PowerShell**；`tests/integration/` 中的跨传输 harness 仅支持 POSIX（依赖 `/proc` 与进程组信号），Windows 原生环境不宣称跑通含 integration 的全量，请改用 WSL 执行（命令仍为单行 PowerShell，见「开发」）。
+**版本状态**：插件 `v0.2.0`（`metadata.yaml` 的 `astrbot_version` 为 `>=4.16,<5`）。对端 DSH 侧配套 `0.2.0`（面向 `@deepseek-ai/dsh` **`0.2.1-rc.2`**）；**R1 的换实例接受规则生效在对端**，只升级 A 时 B 仍按 v0.1 的严格版本单调规则处理。本地测试环境为 **AstrBot 4.29.3 / Python 3.12.16**；用户环境报告为 **4.29.4**，本轮未在 4.29.4 上真实运行验收，只有本机 4.29.3 的宿主契约测试与用户截图所示契约一致，不能据此宣称 4.29.4 已通过。其余 AstrBot 版本均未实测。主要功能已实现，但仍有待真实环境验证项（见文末「已知限制与未验证项」）；**当前快照（2026-11-04）**：A 全量单测 **486 passed（34.05s）**（含本轮 v0.2 新增 16 个用例）；B **424 passed（0 failed / 0 skipped）**、A+B 真实 socket 业务回环 **24 passed**、跨传输 **26 passed**、独立密码学校验 **36/36**；B `tsc -p tsconfig.json --noEmit` 通过。**真实 AstrBot 宿主内的整机联调、真实 OpenAPI/SSE 流、真实 IM 平台、真实 LLM 多模态判定与 TLS 均未验证（BLOCKED-ENV）**。部署前请先读文末「测试现状」与「已知限制与未验证项」。用户命令统一写成**单行 PowerShell**；`tests/integration/` 中的跨传输 harness 仅支持 POSIX（依赖 `/proc` 与进程组信号），Windows 原生环境不宣称跑通含 integration 的全量，请改用 WSL 执行（命令仍为单行 PowerShell，见「开发」）。
 
 ## 功能
 
@@ -20,7 +20,7 @@
 - **对等双向任务**：A→B 与 B→A 完全对称；提交**立即返回** `accepted` / `pending_approval` + `task_id`，结果异步回传。
 - **持久化与幂等**：任务、事件、审批、授权、唤醒计数存 SQLite（`data/plugin_data/astrbot_plugin_dsh_bridge/bridge.db`），重启不丢。
 - **人工审批与业务决策**：三类审批（业务决策 / 跨端提交 / DSH 原生工具）统一进 A 侧待审批队列；**A 侧队列内**同一审批首个答复生效。DSH 原生审批采用 B 侧 claim-or-hand-back，本地 UI 与远端人类并不会同时对同一请求作答——这与原始需求「双方都能答、先答者胜」**不等价**，该竞争语义仍未实现（见「已知限制与未验证项」）。
-- **会话授权治理**：A 侧是授权权威；**Agent 创建会话会先在活动连接上向对端 `session.create` 预约真实会话，只授权对端返回的 id**（不再本机凭空铸造 UUID）；没有 READY 连接、对端超时/拒绝/超配额时创建失败且**不产生本地授权**。成功后在后台授予的**创建配额**内自动授权（带审计标记），超配额拒绝；归档会话在 `task.submit` 处按 `session_archived` 拒绝，自动唤醒投递也会跳过归档会话（不再消耗唤醒链/限速预算）。会话列表与管理员列表输出**完整 UUID**；选择只接受完整 UUID，不支持前缀、不自动选第一个；`dsh_select_session` 当前只做授权校验，不绑定/不切换任务，也不改写已批准内容。
+- **会话授权治理**：A 侧是授权权威；**Agent 创建会话会先在活动连接上向对端 `session.create` 预约真实会话，只授权对端返回的 id**（不再本机凭空铸造 UUID）；没有 READY 连接、对端超时/拒绝/超配额时创建失败且**不产生本地授权**。成功后在后台授予的**创建配额**内自动授权（带审计标记），超配额拒绝；归档会话在 `task.submit` 处按 `session_archived` 拒绝，自动唤醒投递也会跳过归档会话（不再消耗唤醒链/限速预算）。会话列表与管理员列表输出**完整 UUID**；选择只接受完整 UUID，不支持前缀、不自动选第一个；`dsh_select_session` 当前只做授权校验，不绑定/不切换任务，也不改写已批准内容。**v0.2 起**：`session.authz` 始终携带权威实例 `instance_id` 与 `instance_started_at`（同库重启两者都不变、换库即新实例）；管理员可用 `/dsh sessions check [fix]` 与对端授权表对账，`fix` 在创建锁内把本地版本抬到 `max(本地, 对端)+1` 后用严格推送重发权威快照（推送失败如实报错，不假装成功）。
 - **图片输入**：仅任务显式附件，四类 MIME、字节/张数/像素受限，魔数校验；**绝不**抓取任意外部 URL 或聊天历史图片。
 - **中文后台页**：连接状态、会话授权、任务进度、审批四块，**不显示任何密钥**。
 
@@ -147,8 +147,9 @@ A 侧已经把「本端监听」与「对端地址」拆成两组字段（`conn_
 |---|---|---|
 | `/dsh help` | 所有用户 | 帮助 |
 | `/dsh status` | 管理员 | 连接、传输、对端版本、最近错误 |
-| `/dsh tasks [n]` | 管理员 | 最近任务（`→` 本端发起 / `←` 对端发起） |
+| `/dsh tasks [n]` | 管理员 | 最近任务（`→` 本端发起 / `←` 对端发起；输出完整 `task_id`，可直接回传查询） |
 | `/dsh sessions` | 管理员 | 会话授权与 Agent 创建配额（会话 ID 为完整 UUID） |
+| `/dsh sessions check [fix]` | 管理员 | 与对端 `session.list` 对账（不比对实例）；`fix` 抬版到 `max(本地, 对端)+1` 后严格重推再复查（需活动连接） |
 | `/dsh approve <审批号>` | 管理员 | 批准**一次**（审批号可用前几位） |
 | `/dsh reject <审批号> [理由]` | 管理员 | 拒绝 |
 
@@ -170,6 +171,10 @@ A 侧已经把「本端监听」与「对端地址」拆成两组字段（`conn_
 > 无 READY 连接、对端超时、`session_create_denied`、`session_quota_exceeded`、`unknown_message` 等任何失败都会直接返回，
 > **不会本机铸造 UUID，也不会留下授权**。因此“创建成功”意味着对端确实存在该会话，不会再出现本端已授权、对端
 > `session_not_found` 的幽灵会话。
+
+> **授权体检的边界**：`/dsh sessions check` 只对比本地权威表与对端 `session.list` 返回的授权表/活动状态，
+> **不能证明 DSH 侧会话真实存在**（`state=cold` 只表示对端没有活动 agent，不代表没有该会话）。`fix` 只把本地版本 +1
+> 并重推权威快照，不删除、不新增授权，也不改任务；没有活动连接时直接报“无法体检”，不会猜测。
 
 > 这五个适配器是真正的 `FunctionTool` 子类：`handler` 指向实例的 `__call__`，`handler_module_path` 由宿主的 `Context.add_llm_tools` 在注册时写入。因此它们能通过宿主的 `_PermissionGuardedTool` 权限包装与 `FunctionToolExecutor`；恢复为裸类或仅加 `handler` 属性都会在宿主执行时触发 `AttributeError: ... has no attribute 'handler'`。热修同时覆盖“停用（保留工具行）→启用”、卸载按模块路径移除，以及 `initialize` 局部失败后的资源回收。该结论只在本地 AstrBot **4.29.3** 的宿主契约测试中验证，不代表用户报告的 4.29.4 已完成真实运行验收。
 
@@ -212,13 +217,15 @@ AstrBot 插件详情页 → 打开「bridge」视图。包含四块：
 | 配了 `connections` 但只有第一条生效 | 当前版本只为**第一条**连接建立会话，其余条目被忽略（多连接尚未接线） |
 | Webhook 握手成功、随后探测失败 | 不是“预期不可用”：检查两端 `conn_bind_addr`/`conn_bind_port` 是否为对端可达的显式端点、`conn_host`/`conn_port` 是否填对端、防火墙是否放行；状态页会记录回退历史与 `carrier_degraded` |
 | 任务不执行、日志提示 openapi | `openapi_api_key` / `openapi_key_id` 未配置或归属自检失败 |
-| 任务失败 `session_not_found` | 该会话在 DSH 侧不存在。可能是升级前 `dsh_create_session` 留下的幽灵授权（旧版本只在本机铸造 UUID）。先 `dsh_list_sessions` 核对，在后台撤销该旧授权，再用 `dsh_create_session` 重新创建；新版本会先让对端真实建会话，失败则不产生授权。 |
+| 任务失败 `session_not_found` | 该会话在 DSH 侧不存在。可能是升级前 `dsh_create_session` 留下的幽灵授权（旧版本只在本机铸造 UUID）。先 `/dsh sessions check` 对账（会列出「仅本端有」的授权）；确认后在后台撤销该旧授权，再用 `dsh_create_session` 重新创建。新版本会先让对端真实建会话，失败则不产生授权；`fix` 只重推快照，不会代替撤销。 |
 | 审批页按钮不可点 | 未以 Dashboard 身份登录；插件作用域 API Key 无审批权 |
 
 > 日志与代码注释为英文，界面文案为中文；日志中不会出现 PSK 或 API Key。
 
 ## 已知限制与未验证项
 
+- **同秒重建的实例时间戳**：`instance_started_at` 目前是**秒级**。若 A 的数据库在**同一秒内**被重建，新旧实例的该值会相等，对端按 §9.7.1 规则 4 会**拒收**新实例（哪怕 version 更高）——这是故障安全方向（不同步而非回滚授权）。运维侧处理：确认后清理对端 `authz/current` 记录，再让 A 推送；根因修复（改毫秒/单调计数）列入 v0.3 待办。
+- **对端授权缓存被清空会重新打开升级路径**：B 的规则 0（缓存无身份 → 接受首份完整身份）在**本地 `authz/current` 记录被删除或损坏**后会再次生效，一条旧实例快照即可被接受并把授权表回滚。这不是本版本的新增攻击面（通道已认证、帧层 seq 防重放），但需要运维保证该记录不被手工清理；加固（持久化「曾记录身份」标记）列入 v0.3 待办。
 - **真实环境一律 BLOCKED-ENV**：未在真实 AstrBot 宿主进程内跑过完整装配，未接真实 IM 平台，未用真实 OpenAPI/SSE 流执行任务，未用真实 LLM 验证多模态判定，也未验证真实 TLS；以下结论都只能算单测/回环 socket 验证。
 - **多连接**：`connections` 只有第一条会建立会话；同机多对端尚未支持。
 - **Webhook 可用但要求显式双端端点**：A 已拆出独立的 `conn_bind_addr`/`conn_bind_port`，两种 role 都能跑 Webhook；但必须满足「两端都能被回投」——`connect` 侧显式 `conn_bind_port > 0`，跨机 `conn_bind_addr` 为本机可达地址。真实跨机回投仍未验证，只有回环测试通过。
@@ -230,14 +237,17 @@ AstrBot 插件详情页 → 打开「bridge」视图。包含四块：
 - **LLM 工具热修只覆盖已确认缺陷**：已修复五个裸类缺少 `FunctionTool.handler` 导致的宿主执行/重载失败，以及 `initialize` 在 `Store.init` 之后失败时未 `terminate` 的资源泄漏；没有用户失败日志，因此**不能声称所有间歇性 reload 问题都已解决**。宿主契约验证使用本机 AstrBot 4.29.3，用户报告的 4.29.4 未真实运行验收；用户截图只能说明契约一致，不能替代 4.29.4 的运行验收。
 - **原生审批的“先答者胜”未实现**：原始需求要求本地 UI 与远端人类都能作答、先答者胜；B 侧实际采用 claim-or-hand-back（本地或远端二选一），与“先回答者竞争”**不等价**，该需求仍未满足。
 - **Agent 创建改为“对端先建、本端后授权”**：这是对幽灵会话（本端授权一个对端从未创建的 id，任务执行时 `session_not_found`）的修复。它需要活动连接；失败不产生本地授权。两点仍属边界：升级前旧代码留下的授权行不会被自动清理，需管理员在状态页撤销；若对端已创建成功而本端在写授权前崩溃，对端可能留下未被本端授权的孤儿会话（不会被误用，但需人工清理）。该修复仅经本机单测，未在真实宿主/真实网络验收。
-- **类型与验收**：没有独立的类型检查门禁；历史跨端快照里的 19 PASS / 7 `BLOCKED-IMPL` 与更早的 295/335 条数字均已过时，只作存档。当前快照为 A 470 / B 377 / business 24 / cross 26 / crypto 36/36（2026-11-03），B `tsc --noEmit` 通过，真实宿主稳定验收仍 `BLOCKED-ENV`。
+- **授权体检不能证明 DSH 会话真实存在（v0.2）**：`/dsh sessions check` 只反映对端授权表与活动状态，且 `session.list` 应答没有实例字段，因此**不比对实例**；`state=cold` 只表示对端没有活动 agent，不代表 DSH 里没有该会话。`fix` 在创建锁内把本地版本抬到 `max(本地, 对端)+1` 后重推权威快照（对端 `session.create` 也会抬高它自己的版本，简单 `+1` 仍可能被拒），推送失败会如实报错；`fix` 不删除/新增授权、不自动撤销历史幽灵授权，差异消失只说明两端授权表一致，不说明会话可执行。
+- **实例字段与跨端契约（v0.2）**：A 在 `authz_meta` 持久化 `instance_id`（UUIDv4）与 `instance_started_at`（Unix 秒，首次建库时间），同一数据库重启两者都不变，换库文件两者都变化；`session.authz` 始终同时携带两者。`tests/fixtures/session_authz_v02.json` 是两端共享的规范化快照，A 侧用例断言线格式的键集合与类型与它一致，避免再次出现「一端不发字段、另一端永远拒收」。`instance_started_at` 依赖 A 主机时钟单调：重建时若系统时钟显著回拨，新实例会被对端判为更旧而拒收，这是故障安全方向。
+- **R1 换实例规则需要两端同时升级（v0.2）**：`instance_id` / `instance_started_at` 是可选加法；旧版对端缺少/忽略这两个字段时仍按严格版本单调处理，A 重建数据库后的推送可能被判 `stale_authz`。A 侧验证了字段生成、持久化、快照透出与跨端 fixture 契约，但未做真实跨端运行验收。
+- **类型与验收**：没有独立的类型检查门禁；历史跨端快照里的 19 PASS / 7 `BLOCKED-IMPL` 与更早的 295/335 条数字均已过时，只作存档。当前快照（2026-11-04）为 A **486 passed**（含 v0.2 新增 16 个用例）/ B **424 passed**（0 failed / 0 skipped）/ business 24 / cross 26 / crypto 36-36，均为本轮实测；B `tsc --noEmit` 通过，真实宿主稳定验收仍 `BLOCKED-ENV`。
 - **降级回退**：`TransportManager.carrier_degraded()` → `_switch_to_fallback()` 已真实接线，回环用例有通过记录；但真实跨机 Webhook 探测失败后的回退仍未在真实网络验证，不能据此宣称生产可用。
 - 双方都不可达（双 NAT、无公网入口、无隧道）时无法连通，插件只给出可读诊断，不无限重试。
 - 首版仅支持图片，不做一般文件/音频/视频传输。
 
 ## 开发
 
-- **内部工作记录（不随公开包发布）**：协议主本 `开发/v0.1/protocol.md`（`dsh-bridge/v1` + 2026-10-31 的 §12.7 `approval.lookup` 证据契约增补；`LABEL`、密码学套件、AAD 与向量未变，与另一端逐字节一致）、开发规范 `开发/rules.md`、任务拆分 `开发/v0.1/分工.md`、过程记录 `开发/changelog.md`。这些路径只用于内部追溯，公开交付包按「发布与打包」排除 `开发/`。
+- **内部工作记录（不随公开包发布）**：协议主本 `开发/v0.1/protocol.md`（`dsh-bridge/v1` + 2026-10-31 的 §12.7 `approval.lookup` 证据契约增补 + v0.2 §9.7.1 `instance_id` / `instance_started_at` 可选加法；`LABEL`、密码学套件、AAD 与向量未变，与另一端逐字节一致）、开发规范 `开发/rules.md`、v0.1 任务拆分 `开发/v0.1/分工.md`、v0.2 需求 `开发/v0.2/prd.md` 与拆分 `开发/v0.2/分工.md`、v0.2 A 侧测试记录 `开发/v0.2/test/A-session-authz.md`、过程记录 `开发/changelog.md`。这些路径只用于内部追溯，公开交付包按「发布与打包」排除 `开发/`。
 - **公开金标准向量**：[`tests/fixtures/protocol_vectors_v1.json`](tests/fixtures/protocol_vectors_v1.json)（只读）。A 的 `tests/test_vectors.py` 与 B 的 `tests/vectors.test.mjs` 都以它为跨端共同基准；它随公开仓库与完整包发布。
 - 分层（单向依赖）：`transport` → `session` → `app` → `host`，`main.py` 是唯一装配点
 

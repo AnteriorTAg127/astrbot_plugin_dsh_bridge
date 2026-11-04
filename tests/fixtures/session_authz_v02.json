@@ -1,0 +1,22 @@
+{
+  "instance_id": "11111111-2222-4333-8444-555566667777",
+  "instance_started_at": 1730000000,
+  "version": 7,
+  "grants": [
+    {
+      "session_id": "7c4e1a90-1111-4222-8333-444455556666",
+      "purpose": "audit",
+      "title": "Example session",
+      "state": "idle",
+      "granted_by": "human",
+      "granted_by_id": "dashboard",
+      "expires_at": "2026-11-04T12:00:00.000Z",
+      "created_by_task": null
+    }
+  ],
+  "revoked": [
+    "0f9d2c31-2222-4333-8444-555566667777"
+  ],
+  "allow_agent_create": true,
+  "max_agent_sessions": 10
+}

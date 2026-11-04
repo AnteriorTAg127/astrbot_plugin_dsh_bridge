@@ -26,6 +26,7 @@ from ..constants import (
     KIND_EVT,
     MSG_SESSION_AUTHZ,
     MSG_SESSION_CREATE,
+    MSG_SESSION_LIST,
     SESSION_ACTIONS,
     SESSION_STATES,
 )
@@ -654,15 +655,115 @@ class SessionService:
             "authz_version": snapshot["version"],
         }
 
+    def create_lock(self) -> asyncio.Lock:
+        """Return the lock that serialises peer creation and the audit ``fix``.
+
+        The composition root enters this lock around the whole ``fix``
+        orchestration (audit, version floor, strict push, re-audit) so it cannot
+        interleave with ``create_peer_session``.
+
+        Returns:
+            The service-wide creation/audit lock.
+        """
+        return self._create_lock
+
+    async def peer_audit(self) -> dict:
+        """Reconcile the local authority with the peer's ``session.list`` (§9.7).
+
+        ``session.list`` only reflects the peer's authorized table and activity
+        state; it cannot prove that a DSH-side session really exists (``cold``
+        only means no active agent), and it carries no instance field, so the
+        instance is deliberately not compared. This method therefore reports
+        differences and never adds, deletes or guesses a grant.
+
+        Returns:
+            ``{"local_version", "local_instance_id", "peer_authz_version",
+            "both", "only_local", "only_peer"}`` where ``both`` is the sorted
+            intersection of authorized session ids and the ``only_*`` fields are
+            the sorted differences.
+
+        Raises:
+            BridgeError: ``not_ready`` without a READY session (no request is
+                sent), the peer's own error unchanged, or
+                ``capability_unavailable`` for a carrier failure/malformed reply.
+        """
+        session = self._session_provider() if self._session_provider else None
+        if session is None or getattr(session, "state", None) is not SessionState.READY:
+            raise BridgeError(ERR_NOT_READY, details={"reason": "no_ready_session"})
+
+        return await self._audit_round(session)
+
+    async def _audit_round(self, session: Any) -> dict:
+        """Run one ``session.list`` reconciliation round.
+
+        Args:
+            session: Live READY session used for the peer request.
+
+        Returns:
+            Audit report without the ``after`` field.
+
+        Raises:
+            BridgeError: The peer's error unchanged, or ``capability_unavailable``
+                for a carrier failure or an unusable reply.
+        """
+        local = await self._store.authz_snapshot()
+        now = time.time()
+        local_ids = {
+            grant["session_id"]
+            for grant in local["grants"]
+            if grant["expires_at"] is None or grant["expires_at"] > now
+        }
+        try:
+            result = await session.call(
+                MSG_SESSION_LIST,
+                {"purpose": None, "state": "any", "limit": 200, "cursor": None},
+            )
+        except asyncio.CancelledError:
+            raise
+        except BridgeError:
+            raise
+        except Exception as exc:
+            logger.exception("bridge peer audit failed conn=%s", self._conn)
+            raise BridgeError(
+                ERR_CAPABILITY_UNAVAILABLE, details={"reason": "peer_audit_failed"}
+            ) from exc
+
+        items = result.get("sessions") if isinstance(result, dict) else None
+        if not isinstance(items, list):
+            logger.error("bridge peer audit reply has no sessions conn=%s", self._conn)
+            raise BridgeError(
+                ERR_CAPABILITY_UNAVAILABLE,
+                details={"reason": "malformed_session_list"},
+            )
+        peer_ids = {
+            item["session_id"]
+            for item in items
+            if isinstance(item, dict)
+            and isinstance(item.get("session_id"), str)
+            and item["session_id"]
+        }
+        return {
+            "local_version": local["version"],
+            "local_instance_id": local["instance_id"],
+            "peer_authz_version": result.get("authz_version"),
+            "both": sorted(local_ids & peer_ids),
+            "only_local": sorted(local_ids - peer_ids),
+            "only_peer": sorted(peer_ids - local_ids),
+        }
+
     async def snapshot(self) -> dict:
         """Return the full authorization table for ``session.authz`` (§9.7).
 
         Returns:
-            Snapshot with ISO timestamps so it can be serialised directly.
+            Snapshot with the authority ``instance_id`` and
+            ``instance_started_at`` (§9.7.1) plus ISO timestamps so it can be
+            serialised directly.
         """
         snapshot = await self._store.authz_snapshot()
         return {
             "version": snapshot["version"],
+            "instance_id": snapshot["instance_id"],
+            "instance_started_at": snapshot["instance_started_at"],
             "grants": [
                 {**grant, "expires_at": _iso(grant["expires_at"])}
                 for grant in snapshot["grants"]
