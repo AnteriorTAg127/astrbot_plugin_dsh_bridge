@@ -61,6 +61,29 @@ class Facility extends Service {
  * on the next macrotask so `TaskService._runInbound` can reach `succeeded` for
  * real; a held session stays busy until `release()`.
  */
+/**
+ * Host default model (`ctx.get('agentDefaultModel')`) — the policy source that
+ * B's v0.3 delivery boundary requires before it will drive an agent at all.
+ *
+ * The real DSH host exposes this service; a harness without it makes every task
+ * fail with `no_model_route`, which is not what these end-to-end cases measure.
+ */
+class DefaultModel extends Facility {
+  /**
+   * @param {Context} ctx - owning context.
+   */
+  constructor(ctx) {
+    super(ctx, 'agentDefaultModel');
+  }
+
+  /**
+   * @returns {{provider: string, model: string}} the harness default route.
+   */
+  currentSelection() {
+    return { provider: 'harness', model: 'harness-model' };
+  }
+}
+
 class RecordingAgents extends Facility {
   /**
    * @param {Context} ctx - owning context.
@@ -111,7 +134,53 @@ class RecordingAgents extends Facility {
   release(sessionId) {
     const agent = this.map.get(String(sessionId));
     this.held.delete(String(sessionId));
-    if (agent !== undefined) agent._release();
+    if (agent !== undefined) {
+      this._emitTurnEnd(agent);
+      agent._release();
+    }
+  }
+
+  /**
+   * Publish one durable `turn/end` for a delivery.
+   * @param {object} agent - agent that finished the turn.
+   * @returns {void}
+   */
+  _emitTurnEnd(agent) {
+    // v0.3 R6 extracts the assistant text before deciding success: a turn that
+    // ends without any assistant output must be parked, not reported as a
+    // completed task with an empty result. The real host appends both events,
+    // so the harness publishes them in the same order.
+    // The bridge can only attribute a turn it saw open: the real host appends
+    // `turn/start` before any assistant output, so the harness must do the same
+    // or every delivery is classified unknown and parked for a human.
+    this._turnSeq = (this._turnSeq ?? 0) + 1;
+    this.ctx.emit('session/event', { id: agent.id }, {
+      type: 'turn/start',
+      seq: this._turnSeq,
+      time: Date.now(),
+      data: { turn: 1 },
+    });
+    this._turnSeq += 1;
+    this.ctx.emit('session/event', { id: agent.id }, {
+      type: 'assistant/message',
+      seq: this._turnSeq,
+      time: Date.now(),
+      data: {
+        turn: 1,
+        step: 0,
+        message: {
+          content: [{ type: 'text', text: 'harness assistant reply' }],
+          source: { provider: 'harness', model: 'harness-model' },
+        },
+      },
+    });
+    this._turnSeq += 1;
+    this.ctx.emit('session/event', { id: agent.id }, {
+      type: 'turn/end',
+      seq: this._turnSeq,
+      time: Date.now(),
+      data: { turn: 1, reason: { kind: 'completed' } },
+    });
   }
 
   /** @param {string} sessionId - session id. @returns {void} */
@@ -174,6 +243,10 @@ class RecordingAgents extends Facility {
     const commit = () => {
       this.deliveries.push({ session_id: agent.id, strategy, text });
       if (!this.held.has(agent.id)) {
+        // v0.3 R6: the bridge only claims success when it can attribute a
+        // completed `turn/end` to this delivery. The real host publishes that
+        // durable session event, so the harness must too.
+        this._emitTurnEnd(agent);
         setImmediate(() => agent._release());
       }
     };
@@ -248,6 +321,7 @@ const logger = new Logger('business-peer');
 
 const app = new Context();
 const agents = new RecordingAgents(app, deliveryDelayMs);
+new DefaultModel(app);
 new Attachments(app);
 new Tools(app);
 // The real harness approval service, mounted exactly as the deployment does.

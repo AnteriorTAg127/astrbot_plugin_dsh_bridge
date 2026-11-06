@@ -31,6 +31,7 @@ from .constants import (
     STATUS_ACCEPTED,
     STATUS_NEEDS_HUMAN,
     STATUS_REJECTED,
+    STATUS_SUCCEEDED,
     TERMINAL_STATUSES,
 )
 from .errors import (
@@ -395,6 +396,47 @@ class Store:
             raise RuntimeError("Store is not initialised")
         return self._db
 
+    # -- generic metadata --------------------------------------------------------------
+
+    async def get_meta(self, key: str) -> str:
+        """Read one generic ``meta`` value.
+
+        The table also holds ``schema_version``; this accessor is read-only and
+        returns an empty string for an absent key, matching the "unset means
+        unbound" semantics of the landing configuration.
+
+        Args:
+            key: Metadata key.
+
+        Returns:
+            The stored text, or ``""`` when the key does not exist.
+        """
+        db = self._conn()
+        async with db.execute("SELECT value FROM meta WHERE key = ?", (key,)) as cursor:
+            row = await cursor.fetchone()
+        return str(row["value"]) if row is not None else ""
+
+    async def put_meta(self, key: str, value: str) -> None:
+        """Write one generic ``meta`` value.
+
+        ``schema_version`` is owned by :meth:`init` and is deliberately refused
+        here so no feature can silently claim a different schema.
+
+        Args:
+            key: Metadata key.
+            value: Text to store; an empty string means "unset".
+
+        Raises:
+            ValueError: When ``key`` is empty or reserved.
+        """
+        if not key or key == "schema_version":
+            raise ValueError("meta key is empty or reserved")
+        db = self._conn()
+        await db.execute(
+            "INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)", (key, str(value))
+        )
+        await db.commit()
+
     # -- tasks -------------------------------------------------------------------------
 
     async def upsert_task(self, task: dict) -> dict:
@@ -626,17 +668,41 @@ class Store:
             flag = 1 if needs_human else 0
         elif to_status is STATUS_NEEDS_HUMAN:
             flag = 1
+        # ``error.details.degraded`` is a local notification note, not a task
+        # error. A terminal success must not keep showing a stale "notification
+        # degraded" hint from an earlier state, so that single key is dropped
+        # when the row becomes ``succeeded``. Every other error field is kept
+        # verbatim and no error-code semantics change.
+        next_error = _json(error) if error is not None else None
+        clear_degraded = False
+        effective_error = error if error is not None else task.get("error")
+        if to_status is STATUS_SUCCEEDED and isinstance(effective_error, dict):
+            details = effective_error.get("details")
+            if isinstance(details, dict) and "degraded" in details:
+                cleaned = dict(effective_error)
+                remaining = {
+                    key: value for key, value in details.items() if key != "degraded"
+                }
+                if remaining:
+                    cleaned["details"] = remaining
+                else:
+                    cleaned.pop("details", None)
+                next_error = _json(cleaned) if cleaned else None
+                clear_degraded = True
         await db.execute(
             """
             UPDATE tasks SET status = ?, eseq = ?, result = COALESCE(?, result),
-                             error = COALESCE(?, error), needs_human = ?, updated_at = ?
+                             error = CASE WHEN ? THEN ? ELSE COALESCE(?, error) END,
+                             needs_human = ?, updated_at = ?
             WHERE task_id = ?
             """,
             (
                 to_status,
                 max(eseq, int(task["eseq"])),
                 _json(result) if result is not None else None,
-                _json(error) if error is not None else None,
+                1 if clear_degraded else 0,
+                next_error,
+                next_error,
                 flag,
                 now,
                 task_id,
@@ -714,6 +780,38 @@ class Store:
                 task_id,
                 STATUS_REJECTED,
             ),
+        )
+        await db.commit()
+        return await self.get_task(task_id)
+
+    async def mark_task_degraded(self, task_id: str, reason: str) -> dict | None:
+        """Record a local degradation marker inside ``error.details``.
+
+        The marker is deliberately local-only: it explains why a wake was skipped
+        on this endpoint without adding a field to ``task.event`` (§11.4). It does
+        not change the task status, its sequence number or ``updated_at``.
+
+        Args:
+            task_id: Task identifier.
+            reason: Machine-readable reason, for example ``no_umo``.
+
+        Returns:
+            The updated task, or ``None`` when unknown.
+        """
+        task = await self.get_task(task_id)
+        if task is None:
+            return None
+        error = task.get("error")
+        if not isinstance(error, dict):
+            error = {}
+        details = error.get("details")
+        if not isinstance(details, dict):
+            details = {}
+        details["degraded"] = reason
+        error["details"] = details
+        db = self._conn()
+        await db.execute(
+            "UPDATE tasks SET error = ? WHERE task_id = ?", (_json(error), task_id)
         )
         await db.commit()
         return await self.get_task(task_id)

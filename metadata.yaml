@@ -1,10 +1,10 @@
 name: astrbot_plugin_dsh_bridge
 display_name: DSH 桥接（AstrBot ↔ DeepSeek Harness）
 desc: 在 AstrBot 与 DSH 之间建立受控的对等双向通道：任一侧都可发起与执行任务，并把任务结果、业务决策与审批回传；支持 WS/Webhook/长轮询三种传输，全通道 AEAD 加密。
-version: v0.2.0
+version: v0.3.0
 author: AnteriorTAg127
 repo: https://github.com/AnteriorTAg127/astrbot_plugin_dsh_bridge
-short_desc: AstrBot ↔ DSH 对等加密桥接，含人工审批与后台状态页
+short_desc: AstrBot ↔ DSH 对等加密桥接，含落地会话、批量人工审批与后台状态页
 support_platforms:
   - aiocqhttp
   - telegram

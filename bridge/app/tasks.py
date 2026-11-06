@@ -1129,6 +1129,11 @@ class TaskService:
             # event's own terminal pair, never as an arbitrary peer-supplied
             # state.
             status = reported
+        # ``error`` is peer-owned and opaque. Task-level codes such as
+        # ``agent_turn_failed`` / ``agent_output_missing`` are not §15
+        # ``BridgeError`` codes, so they are persisted verbatim rather than
+        # validated against a whitelist (the status comes from the event name,
+        # never from the error code).
         updated = await self._store.transition(
             task_id,
             status,

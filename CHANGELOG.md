@@ -3,6 +3,36 @@
 本文件面向使用者，记录发布版本的可见变更。
 开发过程记录（每次改动、测试与调试）在 `开发/changelog.md`，不随仓库发布。
 
+## [0.3.0] - 2026-11-06
+
+通知落地、批量人工审批与管理员判定加固（A 端 R1/R2/R2b）。`LABEL`、密码学套件、AAD、封帧布局、错误码词表与金标准向量均未改变；数据库不加表、不加列，只在既有 `meta` KV 增加两个非 `schema_version` 键。**auto-review 未实现**（v0.4 待设计）；本版提供的是**批量人工审批**，不是自动批准。
+
+### 新增
+
+- **R1 落地会话（UMO）**：`Store.get_meta(key)` / `put_meta(key, value)` 读写既有 `meta` 表，`schema_version` 由 `init()` 独占并拒绝被覆盖。管理员在目标会话执行 `/dsh bind` 写入 `bridge_landing_umo`（值 = `event.unified_msg_origin`）与 `bridge_landing_meta`（平台 id、会话类型、绑定时间、绑定人）；`/dsh unbind` 幂等清除；`/dsh status` 与后台状态页显示当前绑定。入站任务通知的落点解析为：任务 `payload.umo` → **仅**全局 `bridge_landing_umo`；都没有时写 `info` 日志（`reason=no_umo`）、**不发任何消息**，并在任务本地 `error.details.degraded="no_umo"` 记录（不新增线上字段）。任务进入终态 `succeeded` 时清除此前遗留的该标记（只清 `degraded` 键，错误码语义不变）；若成功通知本身仍降级，会重新如实标注。`approval_notify_umo` 的优先级不变，**不会**被落地绑定接管；未显式配置时审批通知仍只落 Web 页。
+- **R2 批量人工审批**：新增 `/dsh approve all [n]` 与 `/dsh reject all [n]`（管理员）。默认上限 20，显式 `n` 上限 50；每条都走既有 `ApprovalService.human_decide`（`actor_kind="human"`、`actor=astrbot_admin:<id>`、`channel="im"`），逐条输出 `approval_id`、类型/工具摘要与结果；单条失败（例如已过期）如实报告且不影响其它条。空队列返回明确提示。每条决定的 `decided_reason` 以固定前缀记录来源命令：`source_command=approve_all` / `source_command=reject_all`（附人工理由时为 `source_command=...; reason=...`），可 grep 审计；不新增协议/数据库字段。不新增任何自动批准路径，`agent` 来源仍一律拒绝。
+- **R2b 管理员判定加固**：`_is_admin` 不再单独采信 `event.role`，必须同时满足：`sender_id` 非空、事件平台 id 非空且与 UMO 的平台段一致、`sender_id` 命中 `admins_id`。`admins_id` 支持平台限定写法 `"<platform_id>:<sender_id>"`（只匹配该平台实例）；裸 ID 仍保持 AstrBot 的全局语义，但同样要求平台 id 非空且自洽。
+- **对端任务错误码宽容**：`task.event.error` 原样落库与展示，不做 §15 错误码白名单校验；对端任务级码（`agent_turn_failed`、`agent_output_missing` 等）不会改变状态判定，`/dsh tasks` 与后台页遇到未知码不会报错。
+
+### 兼容与迁移
+
+- 既有 `/dsh approve <id>` / `/dsh reject <id>` 行为不变；单条与批量共用同一人工决定路径。
+- 数据库无结构变更：`bridge_landing_umo` / `bridge_landing_meta` 写入既有 `meta` 表，旧库直接可用；`schema_version` 保持 `3`。
+- 行为变更（安全修复）：只把 `event.role` 置为 `admin`、或使用空 `sender_id` / 空平台 / 跨平台同号 id 的调用，不再被判为管理员。既有测试中依赖旧语义的 Event/Host double 已按新语义更新，未放宽任何断言。
+
+### 诚实边界
+
+- **auto-review 未实现**：本轮没有 `policy` / `auto_review_*` / `accept_policy_approvals` 代码或配置；批量审批仍由管理员在 IM 中逐条触发，只是把 N 次点击合成一次命令，**不是**自动批准。
+- **落地绑定是单一全局值**：不做多级回退、不做按会话/按授权绑定，也不改写 `approval_notify_umo`。绑定后通知会以真实 IM 消息进入会话，并触发 AstrBot 的所有插件与指令处理器；第三方插件对消息来源的假设风险由部署方评估（v0.3 未消除，见 README「已知限制」）。
+- **管理员的平台限定需显式配置**：裸 `admins_id` 条目仍是全局语义（AstrBot 既有约定），无法区分不同平台的同号 id；需要跨平台隔离时请写 `"<platform_id>:<sender_id>"`。平台 id 为 AstrBot 平台实例 id（`event.get_platform_id()`），不是平台类型名。
+- 通知仍然只走进程内 `context.send_message`，不扩展 OpenAPI `im` scope；绑定 UMO 的平台实例不在线时按既有 `platform_unreachable` 处理，不消耗唤醒预算。
+
+### 测试
+
+- 新增 `tests/test_v03_admin_and_landing.py`（24 个用例），使用真实 `Store`/`ApprovalService`/`TaskService` + 临时 SQLite，仅 AstrBot 宿主为 double。覆盖：未绑定时零发送、`reason=no_umo` 日志、状态提示、任务本地降级标注与成功后退订；绑定后 `send_text` 的 UMO 逐字等于绑定值、重启（重开 Store）仍保留；非管理员 bind 拒绝且不写库；unbind 幂等；显式 `approval_notify_umo` 仍优先且落地绑定不会自动补位；3 条 pending 的 `approve all` 逐条 allowed-once/human、批量来源命令审计，空队列提示，过期单条失败不影响其它，非管理员零副作用，`agent` actor 仍拒；`agent_turn_failed` / `agent_output_missing` 任务错误码原样落库且状态为 failed；空 sender / 空平台 / 跨平台同号 / 未配置管理员 / 仅 role=admin / UMO 平台不一致均判否，正常裸 ID 与平台限定 ID 均判是，既有管理员指令回归。
+- 先红：首轮 **14 failed, 6 passed（3.02s）**；final-gate 小修先红 **2 failed, 22 passed（3.47s）**。实现后 **24 passed（2.73s）**；A 全量单测（不含 `tests/integration`）**510 passed（37.28s）**。先红/后绿原始输出与改动清单见 `开发/v0.3/test/A-umo-batch-admin.md`。
+- 为适配安全修复，更新了 `tests/test_session_authz_v02.py` 与 `tests/test_session_id_integrity.py` 的 Event/Host double（补 `get_platform_id()`、给 `admins_id` 配置、非管理员改用不同 sender id），所有原有断言保持不变。
+
 ## [0.2.0] - 2026-11-04
 
 会话授权一致性与运维闭环（A 端 R1/R2/R4；R3 已移出 v0.2）。`LABEL`、密码学套件、AAD、封帧布局、错误码词表与金标准向量均未改变；数据库只做加列迁移。
@@ -25,8 +55,8 @@
 - **实例排序依赖 A 主机时钟单调**：对端要求新实例的 `instance_started_at` 严格更大；若 A 重建数据库时系统时钟显著回拨，新实例会被判为更旧而被拒收。这是故障安全方向，需知情接受。
 - **R1 的换实例接受规则生效在对端（B）**：只升级 A 端时，B 仍按 v0.1 的严格版本单调规则处理，A 重建数据库后的推送可能被判 `stale_authz`。本轮 A 侧验证了字段生成、持久化与跨端 fixture 契约，未做真实跨端运行验收。
 - **未在 AstrBot 4.29.4 上真实运行验收**；本版本结论来自本机单测（A 486 passed、B 424 passed，2026-11-04），真实宿主/真实网络仍属 `BLOCKED-ENV`。
-- **同秒重建**：`instance_started_at` 为秒级，同一秒内重建数据库会使新旧实例取值相等，对端按规则 4 拒收新实例（故障安全方向）；需清理对端 `authz/current` 后再推送，根因修复列入 v0.3。
-- **规则 0 可被本地记录丢失重新打开**：B 的 `authz/current` 被删除/损坏后，缓存无身份状态会再次触发一次性升级接受；加固（持久化「曾记录身份」标记）列入 v0.3。
+- **同秒重建**：`instance_started_at` 为秒级，同一秒内重建数据库会使新旧实例取值相等，对端按规则 4 拒收新实例（故障安全方向）；需清理对端 `authz/current` 后再推送，根因修复列入 v0.4（v0.3 未做）。
+- **规则 0 可被本地记录丢失重新打开**：B 的 `authz/current` 被删除/损坏后，缓存无身份状态会再次触发一次性升级接受；加固（持久化「曾记录身份」标记）列入 v0.4（v0.3 未做）。
 
 ### 测试
 

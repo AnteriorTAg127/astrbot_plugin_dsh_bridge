@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import re
 import time
 import uuid
@@ -79,6 +80,12 @@ PLUGIN_NAME = "astrbot_plugin_dsh_bridge"
 VIEW_NAME = "bridge"
 CONN_ID_PATTERN = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
 MAX_WAKE_TEXT = 2000
+#: Generic ``meta`` keys for the single global landing conversation (v0.3 R1).
+LANDING_UMO_KEY = "bridge_landing_umo"
+LANDING_META_KEY = "bridge_landing_meta"
+#: ``/dsh approve all`` and ``/dsh reject all`` bounds.
+BATCH_DEFAULT_LIMIT = 20
+BATCH_MAX_LIMIT = 50
 #: Trust anchor used while no handshake-authenticated peer side exists. It is not a
 #: protocol side, so ``ApprovalService`` refuses ``native_tool`` approvals instead of
 #: falling back to its permissive ``"B"`` default (see ``_rekey_approval_trust``).
@@ -1470,6 +1477,26 @@ class DshBridgePlugin(Star):
                 make_message("req", "decision.answer", params=params)
             )
 
+    async def _landing_binding(self) -> tuple[str, dict]:
+        """Read the single global landing conversation (v0.3 R1).
+
+        Returns:
+            ``(umo, metadata)``; both are empty when no binding exists. Invalid
+            metadata JSON degrades to an empty object instead of breaking status
+            rendering or wake delivery.
+        """
+        if self._store is None:
+            return "", {}
+        umo = await self._store.get_meta(LANDING_UMO_KEY)
+        if not umo:
+            return "", {}
+        raw = await self._store.get_meta(LANDING_META_KEY)
+        try:
+            meta = json.loads(raw) if raw else {}
+        except (TypeError, ValueError):
+            meta = {}
+        return umo, meta if isinstance(meta, dict) else {}
+
     async def _on_task_state_change(self, task: dict, event: str) -> None:
         """Wake the originating conversation for terminal and blocking states (§16.6).
 
@@ -1498,6 +1525,13 @@ class DshBridgePlugin(Star):
         payload = task.get("payload") or {}
         umo = payload.get("umo") or payload.get("session_umo")
         if not umo:
+            # Only the single global binding is consulted. There is deliberately no
+            # per-session or approval_notify_umo fallback: an explicit target stays
+            # explicit, and a web-only deployment must not start sending IM.
+            umo, _meta = await self._landing_binding()
+        if not umo:
+            if self._store is not None:
+                await self._store.mark_task_degraded(task["task_id"], "no_umo")
             logger.info(
                 "bridge wake skipped task=%s event=%s reason=no_umo",
                 task["task_id"],
@@ -1647,11 +1681,15 @@ class DshBridgePlugin(Star):
         yield event.plain_result(
             "DSH 桥接指令：\n"
             "/dsh status — 连接与传输概况\n"
+            "/dsh bind — 绑定本会话为任务通知落地会话\n"
+            "/dsh unbind — 解除落地会话绑定\n"
             "/dsh tasks [n] — 最近任务（双向标注，完整 task_id）\n"
             "/dsh sessions — 会话与授权概览\n"
             "/dsh sessions check [fix] — 与对端授权表对账；fix 重推权威快照\n"
             "/dsh approve <审批号> — 批准一次（仅人可批）\n"
+            "/dsh approve all [n] — 批量批准待审批项（默认 20，最多 50）\n"
             "/dsh reject <审批号> [理由] — 拒绝\n"
+            "/dsh reject all [n] — 批量拒绝待审批项（默认 20，最多 50）\n"
             "任务提交与查询请通过 LLM 工具 dsh_submit_task / dsh_task_status 完成。"
         )
 
@@ -1667,6 +1705,7 @@ class DshBridgePlugin(Star):
             return
         diagnostics = self._manager.diagnostics() if self._manager else {}
         session = self._session
+        landing_umo, landing_meta = await self._landing_binding()
         lines = [
             "【DSH 桥接状态】",
             f"连接：{self._connection_state}（{self._connection_reason}）",
@@ -1674,6 +1713,14 @@ class DshBridgePlugin(Star):
             f"首选 {diagnostics.get('preferred') or '-'}",
             f"已降级：{'是' if diagnostics.get('degraded') else '否'}",
         ]
+        if landing_umo:
+            platform_id = landing_meta.get("platform_id") or "-"
+            bound_at = landing_meta.get("bound_at") or "-"
+            lines.append(
+                f"落地会话：{landing_umo}（平台 {platform_id}，绑定于 {bound_at}）"
+            )
+        else:
+            lines.append("落地会话：未绑定落地会话（任务通知不会发送 IM）")
         if session is not None and session.peer_caps:
             caps = session.peer_caps
             lines.append(
@@ -1685,6 +1732,66 @@ class DshBridgePlugin(Star):
         if diagnostics.get("last_error"):
             lines.append(f"最近错误：{diagnostics['last_error']}")
         yield event.plain_result("\n".join(lines))
+
+    @dsh.command("bind")
+    async def dsh_bind(self, event: AstrMessageEvent):
+        """Bind the current conversation as the task-notification landing (admin).
+
+        The value is written to the generic ``meta`` table so it survives a
+        restart. Only one global binding exists; it affects wake delivery and
+        nothing else (no task execution, no authorization).
+
+        Args:
+            event: Incoming message event.
+        """
+        if not self._is_admin(event):
+            yield event.plain_result("该指令仅管理员可用。")
+            return
+        if self._store is None:
+            yield event.plain_result("桥接尚未初始化。")
+            return
+        umo = str(getattr(event, "unified_msg_origin", "") or "").strip()
+        platform_id = str(event.get_platform_id() or "").strip()
+        if not umo or any(ord(char) < 32 for char in umo):
+            yield event.plain_result("绑定失败：UMO 为空或包含控制字符。")
+            return
+        if not platform_id or umo.split(":", 1)[0] != platform_id:
+            yield event.plain_result("绑定失败：事件平台与 UMO 平台不一致。")
+            return
+        if self._platform is None or not self._platform.can_send(umo):
+            yield event.plain_result("绑定失败：该平台当前不可投递。")
+            return
+        message_type = umo.split(":", 2)[1] if umo.count(":") >= 2 else ""
+        with contextlib.suppress(Exception):
+            message_type = event.get_message_type().value
+        meta = {
+            "platform_id": platform_id,
+            "message_type": message_type,
+            "bound_at": utc_iso_ms(),
+            "bound_by": str(event.get_sender_id()),
+        }
+        await self._store.put_meta(LANDING_UMO_KEY, umo)
+        await self._store.put_meta(
+            LANDING_META_KEY, json.dumps(meta, ensure_ascii=False)
+        )
+        yield event.plain_result(f"已绑定落地会话：{umo}")
+
+    @dsh.command("unbind")
+    async def dsh_unbind(self, event: AstrMessageEvent):
+        """Clear the landing binding (admin, idempotent).
+
+        Args:
+            event: Incoming message event.
+        """
+        if not self._is_admin(event):
+            yield event.plain_result("该指令仅管理员可用。")
+            return
+        if self._store is None:
+            yield event.plain_result("桥接尚未初始化。")
+            return
+        await self._store.put_meta(LANDING_UMO_KEY, "")
+        await self._store.put_meta(LANDING_META_KEY, "")
+        yield event.plain_result("已解除落地会话绑定（未绑定落地会话）。")
 
     @dsh.command("tasks")
     async def dsh_tasks(self, event: AstrMessageEvent, count: int = 10):
@@ -1860,15 +1967,29 @@ class DshBridgePlugin(Star):
         return "\n".join(lines)
 
     @dsh.command("approve")
-    async def dsh_approve(self, event: AstrMessageEvent, approval_id: str = ""):
-        """批准一条待审批请求（仅管理员，一次有效）。
+    async def dsh_approve(
+        self, event: AstrMessageEvent, approval_id: str = "", batch_limit: str = ""
+    ):
+        """批准一条待审批请求，或用 ``all`` 批量批准（仅管理员，一次有效）。
 
         Args:
             event: Incoming message event.
-            approval_id: Approval identifier (a unique prefix is accepted).
+            approval_id: Approval identifier (a unique prefix is accepted) or
+                ``all`` for the pending batch.
+            batch_limit: Optional batch size after ``all`` (default 20, max 50).
         """
         if not self._is_admin(event):
             yield event.plain_result("该指令仅管理员可用。")
+            return
+        if (approval_id or "").strip().lower() == "all":
+            async for line in self._decide_all_from_command(
+                event,
+                allowed=True,
+                raw_limit=batch_limit,
+                reason=None,
+                source_command="approve_all",
+            ):
+                yield event.plain_result(line)
             return
         async for line in self._decide_from_command(
             event, approval_id, allowed=True, reason=None
@@ -1879,15 +2000,31 @@ class DshBridgePlugin(Star):
     async def dsh_reject(
         self, event: AstrMessageEvent, approval_id: str = "", reason: str = ""
     ):
-        """拒绝一条待审批请求（仅管理员）。
+        """拒绝一条待审批请求，或用 ``all`` 批量拒绝（仅管理员）。
+
+        ``/dsh reject all [n]`` treats a numeric second argument as the batch
+        size; any other text is used as the human reason for every row.
 
         Args:
             event: Incoming message event.
-            approval_id: Approval identifier (a unique prefix is accepted).
-            reason: Optional reason.
+            approval_id: Approval identifier (a unique prefix is accepted) or
+                ``all`` for the pending batch.
+            reason: Optional reason, or the batch size after ``all``.
         """
         if not self._is_admin(event):
             yield event.plain_result("该指令仅管理员可用。")
+            return
+        if (approval_id or "").strip().lower() == "all":
+            raw_limit = reason if (reason or "").strip().isdigit() else ""
+            batch_reason = None if raw_limit else (reason or None)
+            async for line in self._decide_all_from_command(
+                event,
+                allowed=False,
+                raw_limit=raw_limit,
+                reason=batch_reason,
+                source_command="reject_all",
+            ):
+                yield event.plain_result(line)
             return
         async for line in self._decide_from_command(
             event, approval_id, allowed=False, reason=reason or None
@@ -1930,6 +2067,89 @@ class DshBridgePlugin(Star):
             return
         yield f"已{'批准（仅一次）' if allowed else '拒绝'}：{resolved}"
 
+    async def _decide_all_from_command(
+        self,
+        event: AstrMessageEvent,
+        *,
+        allowed: bool,
+        raw_limit: str,
+        reason: str | None,
+        source_command: str,
+    ):
+        """Apply one human decision to each pending approval, independently.
+
+        Every row goes through :meth:`ApprovalService.human_decide`, so the
+        recorded ``actor_kind`` stays ``human`` and the one-shot semantics are
+        unchanged. A failure (for example an expired row) is reported for that id
+        only; the loop continues.
+
+        PRD §2.2 requires the originating command to be auditable. No protocol or
+        DB field is added: ``decided_reason`` gets a fixed
+        ``source_command=<name>`` prefix (the optional human reason follows).
+
+        Args:
+            event: Incoming message event.
+            allowed: ``True`` to allow once, ``False`` to reject.
+            raw_limit: Optional batch size text (default 20, clamped to 50).
+            reason: Optional human reason applied to every row.
+            source_command: Command label, ``approve_all`` or ``reject_all``.
+
+        Yields:
+            One multi-line report, including every ``approval_id`` and its result.
+        """
+        if self._approvals is None or self._store is None:
+            yield "桥接尚未初始化。"
+            return
+        try:
+            limit = int(str(raw_limit).strip()) if str(raw_limit).strip() else 0
+        except (TypeError, ValueError):
+            limit = 0
+        if limit < 1:
+            limit = BATCH_DEFAULT_LIMIT
+        limit = min(limit, BATCH_MAX_LIMIT)
+        await self._flush_native_sweeps()
+        pending = await self._store.list_approvals(state="pending", limit=limit)
+        pending = pending[:limit]
+        if not pending:
+            yield "当前没有待审批项，未执行任何操作。"
+            return
+        actor = f"astrbot_admin:{event.get_sender_id()}"
+        decided_reason = f"source_command={source_command}"
+        if reason:
+            decided_reason = f"{decided_reason}; reason={reason}"
+        verb = "批准（仅一次）" if allowed else "拒绝"
+        lines = [
+            f"批量{'批准' if allowed else '拒绝'}：共 {len(pending)} 条"
+            f"（本次上限 {limit}，逐条人工决定）"
+        ]
+        for approval in pending:
+            approval_id = approval["approval_id"]
+            summary = str(approval.get("approval_type") or "unknown")
+            if approval.get("tool"):
+                summary = f"{summary}/{approval['tool']}"
+            try:
+                applied, failure = await self._approvals.human_decide(
+                    approval_id,
+                    allowed=allowed,
+                    actor=actor,
+                    channel="im",
+                    reason=decided_reason,
+                )
+            except BridgeError as exc:
+                lines.append(f"{approval_id}（{summary}）失败：{exc.code}")
+                continue
+            except Exception:
+                logger.exception("bridge batch approval failed id=%s", approval_id)
+                lines.append(f"{approval_id}（{summary}）失败：internal_error")
+                continue
+            if applied:
+                lines.append(f"{approval_id}（{summary}）已{verb}")
+            else:
+                lines.append(
+                    f"{approval_id}（{summary}）未生效：{failure or 'unknown'}"
+                )
+        yield "\n".join(lines)
+
     async def _resolve_approval_id(self, raw: str) -> str | None:
         """Resolve a full approval id or a unique prefix.
 
@@ -1956,19 +2176,49 @@ class DshBridgePlugin(Star):
     def _is_admin(self, event: AstrMessageEvent) -> bool:
         """Whether the sender may use administrative commands.
 
-        Uses AstrBot's own permission model; the bridge never fabricates a role.
+        The check is deliberately independent of ``event.role``: the host writes
+        that plain attribute and other plugins can change it, so only the live
+        ``admins_id`` configuration grants authority. Both the sender id and the
+        platform instance id must be non-empty, and the platform segment embedded
+        in the event UMO must agree with ``get_platform_id()`` (an inconsistent
+        event is a forgery signal, not an administrator).
+
+        ``admins_id`` entries may be bare (``"123"``) or platform-qualified
+        (``"aiocqhttp:123"``). A qualified entry only matches that exact platform
+        instance, which is the supported way to stop a same-numbered account on
+        another platform from impersonating the administrator.
 
         Args:
             event: Incoming message event.
 
         Returns:
-            ``True`` when the sender is an AstrBot administrator.
+            ``True`` only for a configured administrator on a consistent platform.
         """
-        if getattr(event, "role", None) == "admin":
-            return True
         try:
+            sender = str(event.get_sender_id() or "").strip()
+            platform_id = str(event.get_platform_id() or "").strip()
+            if not sender or not platform_id:
+                return False
+            umo = str(getattr(event, "unified_msg_origin", "") or "")
+            if umo:
+                umo_platform = umo.split(":", 1)[0].strip()
+                if not umo_platform or umo_platform != platform_id:
+                    return False
             admins = self.context.get_config().get("admins_id", [])
-            return str(event.get_sender_id()) in [str(item) for item in admins]
+            if not isinstance(admins, (list, tuple)):
+                return False
+            for raw in admins:
+                entry = str(raw or "").strip()
+                if not entry:
+                    continue
+                admin_platform, separator, admin_sender = entry.partition(":")
+                if separator and admin_platform and admin_sender:
+                    if admin_platform == platform_id and admin_sender == sender:
+                        return True
+                    continue
+                if entry == sender:
+                    return True
+            return False
         except Exception:
             logger.exception("bridge admin check failed")
             return False
@@ -2231,10 +2481,15 @@ class DshBridgePlugin(Star):
         session = self._session
         conn = self._primary() or {}
         peer = session.peer_caps or {} if session else {}
+        landing_umo, landing_meta = await self._landing_binding()
+        landing: dict[str, Any] = {"bound": bool(landing_umo)}
+        if landing_umo:
+            landing.update({"umo": landing_umo, "meta": landing_meta})
         return json_response(
             {
                 # Single source of truth: the same check that gates approval writes.
                 "can_write": self._api_authorised(),
+                "landing": landing,
                 "connection": {
                     "state": self._connection_state,
                     "reason": self._connection_reason,

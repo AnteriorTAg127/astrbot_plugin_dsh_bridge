@@ -214,6 +214,13 @@
           state.canWrite = data?.can_write === true;
           const conn = data.connection || {};
           const diag = data.diagnostics || {};
+          const landing = data.landing || {};
+          const landingValue = landing.bound
+            ? `<span class="mono">${esc(landing.umo)}</span>` +
+              (landing.meta && landing.meta.platform_id
+                ? `（平台 ${esc(landing.meta.platform_id)}）`
+                : "")
+            : '<span class="warn">未绑定落地会话（任务通知不会发 IM）</span>';
           document.getElementById("conn-dot").textContent = conn.state || "未知";
           document.getElementById("conn-dot").className =
             "pill " + stateClass(conn.state);
@@ -228,6 +235,7 @@
             ["对端宿主", esc(conn.peer_host)],
             ["对端版本", esc(conn.peer_version)],
             ["会话 ID", `<span class="mono">${esc(conn.sid)}</span>`],
+            ["落地会话", landingValue],
             ["PSK", conn.psk_configured ? '<span class="ok">已配置</span>' : '<span class="bad">未配置（无法连接）</span>'],
             ["OpenAPI", conn.openapi_configured ? '<span class="ok">已配置</span>' : '<span class="warn">未配置（无法执行任务）</span>'],
             ["最近错误", esc(conn.reason || diag.last_error)],
@@ -331,9 +339,17 @@
                 task.direction === "outbound"
                   ? '<span class="pill">本端发起 →</span>'
                   : '<span class="pill">← 对端发起</span>';
+              const degraded =
+                task.error &&
+                task.error.details &&
+                task.error.details.degraded
+                  ? `通知降级：${task.error.details.degraded}`
+                  : "";
               const summary =
                 (task.result && task.result.summary) ||
-                (task.error && `${task.error.code}：${task.error.message}`) ||
+                (task.error && task.error.code
+                  ? `${task.error.code}：${task.error.message || ""}`
+                  : degraded) ||
                 "—";
               const actions = task.needs_human
                 ? `<button data-resolve="${esc(task.task_id)}" data-action="retry" data-write ${state.canWrite ? "" : "disabled"}>重试</button>

@@ -81,14 +81,24 @@ class Event:
             admin: Whether the sender is an administrator.
         """
         self.role = "admin" if admin else "member"
+        self._admin = admin
 
     def get_sender_id(self) -> str:
         """Return a stable sender id.
 
         Returns:
-            The sender id.
+            The sender id: the configured admin when ``admin`` is true, otherwise
+            a different member (v0.3 hardening no longer trusts ``role`` alone).
         """
-        return "admin-1"
+        return "admin-1" if self._admin else "member-1"
+
+    def get_platform_id(self) -> str:
+        """Return the platform instance id.
+
+        Returns:
+            The platform instance id backing ``unified_msg_origin``.
+        """
+        return "platform"
 
     def plain_result(self, text: str) -> str:
         """Build the object the command handler yields.
@@ -109,9 +119,9 @@ class Host:
         """Return the host configuration.
 
         Returns:
-            An empty configuration mapping.
+            A configuration with the one administrator the event doubles use.
         """
-        return {}
+        return {"admins_id": ["admin-1"]}
 
 
 class PeerLink:
