@@ -38,6 +38,7 @@ from .bridge.app.sessions import SessionService
 from .bridge.app.tasks import TaskService
 from .bridge.constants import (
     APPROVAL_ALLOWING_OUTCOMES,
+    APPROVAL_BUSINESS_DECISION,
     DEFAULT_WAKE_MAX_CHAIN,
     DEFAULT_WAKE_RATE_PER_MINUTE,
     DIRECTION_OUTBOUND,
@@ -86,6 +87,13 @@ LANDING_META_KEY = "bridge_landing_meta"
 #: ``/dsh approve all`` and ``/dsh reject all`` bounds.
 BATCH_DEFAULT_LIMIT = 20
 BATCH_MAX_LIMIT = 50
+#: ``/dsh pending [n]`` bounds (v0.3.1 quick approval UX).
+PENDING_DEFAULT_LIMIT = 5
+PENDING_MAX_LIMIT = 20
+#: Approval summary width in command output; long reasons are clipped for IM.
+APPROVAL_BRIEF_MAX = 80
+#: Copy-paste hint appended to approval notifications and the wake text.
+QUICK_APPROVAL_HINT = "回复 /dsh approve 即可批准最新一项，或 /dsh approve <id> 指定。"
 #: Trust anchor used while no handshake-authenticated peer side exists. It is not a
 #: protocol side, so ``ApprovalService`` refuses ``native_tool`` approvals instead of
 #: falling back to its permissive ``"B"`` default (see ``_rekey_approval_trust``).
@@ -1605,6 +1613,7 @@ class DshBridgePlugin(Star):
             lines.append("需要你做出业务决策，请到后台页或使用 /dsh 指令处理。")
         if event == "needs_approval":
             lines.append("需要你批准，请到后台页或使用 /dsh approve 处理。")
+            lines.append(QUICK_APPROVAL_HINT)
         return "\n".join(lines)[:MAX_WAKE_TEXT]
 
     async def _on_human_notify(self, payload: dict) -> None:
@@ -1639,6 +1648,13 @@ class DshBridgePlugin(Star):
             f"审批号：{payload.get('approval_id')}\n"
             "请使用 /dsh approve 或 /dsh reject 处理。"
         )
+        # A timeout announcement and a business decision are not answerable through
+        # ``/dsh approve``; only a live approval carries the copy-paste hint.
+        if (
+            payload.get("timed_out") is not True
+            and payload.get("approval_type") != APPROVAL_BUSINESS_DECISION
+        ):
+            text = f"{text}\n{QUICK_APPROVAL_HINT}"
         await platform.send_text(umo, text[:MAX_WAKE_TEXT])
 
     # -- background maintenance --------------------------------------------------------
@@ -1686,8 +1702,11 @@ class DshBridgePlugin(Star):
             "/dsh tasks [n] — 最近任务（双向标注，完整 task_id）\n"
             "/dsh sessions — 会话与授权概览\n"
             "/dsh sessions check [fix] — 与对端授权表对账；fix 重推权威快照\n"
+            "/dsh pending [n] — 列出待审批项（默认 5，最多 20；完整审批号可复制）\n"
+            "/dsh approve — 批准最新一条待审批项（仅人可批）\n"
             "/dsh approve <审批号> — 批准一次（仅人可批）\n"
             "/dsh approve all [n] — 批量批准待审批项（默认 20，最多 50）\n"
+            "/dsh reject — 拒绝最新一条待审批项\n"
             "/dsh reject <审批号> [理由] — 拒绝\n"
             "/dsh reject all [n] — 批量拒绝待审批项（默认 20，最多 50）\n"
             "任务提交与查询请通过 LLM 工具 dsh_submit_task / dsh_task_status 完成。"
@@ -1966,22 +1985,83 @@ class DshBridgePlugin(Star):
         )
         return "\n".join(lines)
 
+    @dsh.command("pending")
+    async def dsh_pending(self, event: AstrMessageEvent, count: int = 5):
+        """列出待审批项（仅管理员，默认 5 条，最多 20 条）。
+
+        Args:
+            event: Incoming message event.
+            count: Number of items to show (default 5, max 20).
+        """
+        if not self._is_admin(event):
+            yield event.plain_result("该指令仅管理员可用。")
+            return
+        if self._store is None:
+            yield event.plain_result("桥接尚未初始化。")
+            return
+        limit = _int(count, PENDING_DEFAULT_LIMIT, minimum=1, maximum=PENDING_MAX_LIMIT)
+        await self._flush_native_sweeps()
+        now = time.time()
+        pending = [
+            approval
+            for approval in await self._store.list_approvals(state="pending", limit=200)
+            if approval["expires_at"] > now
+        ]
+        if not pending:
+            yield event.plain_result("当前没有待审批项。")
+            return
+        shown = pending[:limit]
+        total = f"{len(pending)}" if len(pending) < 200 else "200+"
+        lines = [
+            f"【待审批】共 {total} 条，显示最新 {len(shown)} 条"
+            f"（上限 {PENDING_MAX_LIMIT}）",
+            "复制完整审批号执行 /dsh approve <审批号> 或 /dsh reject <审批号>。",
+        ]
+        for index, approval in enumerate(shown, start=1):
+            kind = str(approval.get("approval_type") or "unknown")
+            if approval.get("tool"):
+                kind = f"{kind}/{approval['tool']}"
+            task_id = approval.get("task_id") or approval.get("root_task_id") or "-"
+            origin_side = approval.get("origin_side") or "-"
+            display = approval.get("display_reason") or {}
+            brief = ""
+            if isinstance(display, dict):
+                brief = str(display.get("zh") or display.get("en") or "")
+            brief = (brief or str(approval.get("reason") or "")).strip()
+            if not brief:
+                brief = "-"
+            lines.append(
+                f"{index}. {approval['approval_id']} {kind} 来源={origin_side} "
+                f"任务={task_id} 摘要={brief[:APPROVAL_BRIEF_MAX]}"
+            )
+        yield event.plain_result("\n".join(lines))
+
     @dsh.command("approve")
     async def dsh_approve(
         self, event: AstrMessageEvent, approval_id: str = "", batch_limit: str = ""
     ):
         """批准一条待审批请求，或用 ``all`` 批量批准（仅管理员，一次有效）。
 
+        Without an id the newest actionable pending approval is used. The
+        decision still goes through ``human_decide`` with ``actor_kind="human"``.
+
         Args:
             event: Incoming message event.
-            approval_id: Approval identifier (a unique prefix is accepted) or
-                ``all`` for the pending batch.
+            approval_id: Approval identifier (a unique prefix is accepted),
+                ``all`` for the pending batch, or empty for the newest row.
             batch_limit: Optional batch size after ``all`` (default 20, max 50).
         """
         if not self._is_admin(event):
             yield event.plain_result("该指令仅管理员可用。")
             return
-        if (approval_id or "").strip().lower() == "all":
+        raw_id = (approval_id or "").strip()
+        if not raw_id:
+            async for line in self._decide_latest_from_command(
+                event, allowed=True, source_command="approve_latest"
+            ):
+                yield event.plain_result(line)
+            return
+        if raw_id.lower() == "all":
             async for line in self._decide_all_from_command(
                 event,
                 allowed=True,
@@ -1992,7 +2072,7 @@ class DshBridgePlugin(Star):
                 yield event.plain_result(line)
             return
         async for line in self._decide_from_command(
-            event, approval_id, allowed=True, reason=None
+            event, raw_id, allowed=True, reason=None
         ):
             yield event.plain_result(line)
 
@@ -2004,17 +2084,25 @@ class DshBridgePlugin(Star):
 
         ``/dsh reject all [n]`` treats a numeric second argument as the batch
         size; any other text is used as the human reason for every row.
+        Without an id the newest actionable pending approval is used.
 
         Args:
             event: Incoming message event.
-            approval_id: Approval identifier (a unique prefix is accepted) or
-                ``all`` for the pending batch.
+            approval_id: Approval identifier (a unique prefix is accepted),
+                ``all`` for the pending batch, or empty for the newest row.
             reason: Optional reason, or the batch size after ``all``.
         """
         if not self._is_admin(event):
             yield event.plain_result("该指令仅管理员可用。")
             return
-        if (approval_id or "").strip().lower() == "all":
+        raw_id = (approval_id or "").strip()
+        if not raw_id:
+            async for line in self._decide_latest_from_command(
+                event, allowed=False, source_command="reject_latest"
+            ):
+                yield event.plain_result(line)
+            return
+        if raw_id.lower() == "all":
             raw_limit = reason if (reason or "").strip().isdigit() else ""
             batch_reason = None if raw_limit else (reason or None)
             async for line in self._decide_all_from_command(
@@ -2027,7 +2115,7 @@ class DshBridgePlugin(Star):
                 yield event.plain_result(line)
             return
         async for line in self._decide_from_command(
-            event, approval_id, allowed=False, reason=reason or None
+            event, raw_id, allowed=False, reason=reason or None
         ):
             yield event.plain_result(line)
 
@@ -2066,6 +2154,72 @@ class DshBridgePlugin(Star):
             yield f"该审批已处理或已过期（{failure or 'unknown'}），本次操作未生效。"
             return
         yield f"已{'批准（仅一次）' if allowed else '拒绝'}：{resolved}"
+
+    async def _decide_latest_from_command(
+        self, event: AstrMessageEvent, *, allowed: bool, source_command: str
+    ):
+        """Apply one human decision to the newest actionable pending approval.
+
+        ``/dsh approve`` / ``/dsh reject`` without an id use this path. Row
+        selection is automated, but the decision itself still goes through
+        :meth:`ApprovalService.human_decide` with ``actor_kind="human"`` and the
+        one-shot semantics are unchanged. Expired-but-not-yet-swept rows are
+        skipped so the newest *actionable* row is chosen.
+
+        Args:
+            event: Incoming message event.
+            allowed: ``True`` to allow once, ``False`` to reject.
+            source_command: Audit label recorded in ``decided_reason``.
+
+        Yields:
+            The decision report, including the approval id and its summary.
+        """
+        if self._approvals is None or self._store is None:
+            yield "桥接尚未初始化。"
+            return
+        await self._flush_native_sweeps()
+        now = time.time()
+        pending = [
+            approval
+            for approval in await self._store.list_approvals(state="pending", limit=200)
+            if approval["expires_at"] > now
+        ]
+        if not pending:
+            yield "当前没有待审批项，未执行任何操作。"
+            return
+        approval = pending[0]
+        approval_id = approval["approval_id"]
+        kind = str(approval.get("approval_type") or "unknown")
+        if approval.get("tool"):
+            kind = f"{kind}/{approval['tool']}"
+        task_id = approval.get("task_id") or approval.get("root_task_id") or "-"
+        origin_side = approval.get("origin_side") or "-"
+        display = approval.get("display_reason") or {}
+        brief = ""
+        if isinstance(display, dict):
+            brief = str(display.get("zh") or display.get("en") or "")
+        brief = (brief or str(approval.get("reason") or "")).strip()
+        if not brief:
+            brief = "-"
+        detail = (
+            f"审批号：{approval_id}\n类型：{kind}\n来源：{origin_side}\n"
+            f"任务：{task_id}\n摘要：{brief[:APPROVAL_BRIEF_MAX]}"
+        )
+        actor = f"astrbot_admin:{event.get_sender_id()}"
+        applied, failure = await self._approvals.human_decide(
+            approval_id,
+            allowed=allowed,
+            actor=actor,
+            channel="im",
+            reason=f"source_command={source_command}",
+        )
+        if not applied:
+            yield (
+                f"最新待审批项未生效（{failure or 'unknown'}），"
+                f"本次操作未改变任何审批。\n{detail}"
+            )
+            return
+        yield f"已{'批准（仅一次）' if allowed else '拒绝'}最新待审批项。\n{detail}"
 
     async def _decide_all_from_command(
         self,

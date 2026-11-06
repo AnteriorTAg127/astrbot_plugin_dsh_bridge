@@ -1,4 +1,4 @@
-"""v0.3 R1/R2/R2b: landing UMO, batch human approval and hardened admin checks.
+"""v0.3 R1/R2/R2b and v0.3.1 quick-approval UX: landing UMO, human approval, admin.
 
 These cases use the real composition root. ``Store``, ``ApprovalService`` and
 ``TaskService`` are the production classes and SQLite is a temporary file; only
@@ -9,11 +9,16 @@ AstrBot itself is a host double. They pin the security-relevant behaviour:
 * ``/dsh approve all`` / ``/dsh reject all`` still record a *human* decision per
   row, never a policy decision, and one failure cannot stop the rest;
 * ``_is_admin`` rejects empty senders, empty platforms, cross-platform ids and
-  unconfigured admins, and no longer trusts ``event.role`` on its own.
+  unconfigured admins, and no longer trusts ``event.role`` on its own;
+* v0.3.1 ``/dsh approve`` / ``/dsh reject`` without an id still call
+  ``human_decide`` (``actor_kind="human"``), only selecting the newest pending
+  row; ``/dsh pending`` mirrors the real queue and its notification hint never
+  turns an approval into an automatic decision.
 """
 
 from __future__ import annotations
 
+import asyncio
 import importlib
 import json
 import logging
@@ -253,13 +258,16 @@ async def make_task(store, task_id: str, **overrides) -> dict:
     return task
 
 
-async def create_pending(plugin, task_id: str, *, tool: str = "astr_agent_run") -> str:
+async def create_pending(
+    plugin, task_id: str, *, tool: str = "astr_agent_run", reason: str = "test approval"
+) -> str:
     """Create one real pending ``cross_end_submit`` approval.
 
     Args:
         plugin: Initialised plugin with a real ``ApprovalService``.
         task_id: Owning task identifier.
         tool: Action label.
+        reason: Human-facing reason recorded on the approval.
 
     Returns:
         The approval id.
@@ -279,8 +287,8 @@ async def create_pending(plugin, task_id: str, *, tool: str = "astr_agent_run") 
     approval = await plugin._approvals.create_cross_end_submit(
         task={"task_id": task_id, "root_task_id": task_id},
         tool=tool,
-        reason="test approval",
-        display_reason={"zh": "测试审批"},
+        reason=reason,
+        display_reason={"zh": f"测试审批：{reason}"},
         params=params,
     )
     return approval["approval_id"]
@@ -760,3 +768,299 @@ async def test_success_clears_stale_degraded_marker(plugin_factory) -> None:
     assert updated["result"] == {"summary": "done"}
     details = (updated["error"] or {}).get("details") or {}
     assert "degraded" not in details
+
+
+# -- v0.3.1: quick approval UX (no protocol or approval-semantics change) -----------
+
+QUICK_HINT = "回复 /dsh approve 即可批准最新一项，或 /dsh approve <id> 指定。"
+
+
+async def make_two_pending(plugin):
+    """Create an older and a newer pending approval, distinct and ordered.
+
+    Args:
+        plugin: Initialised plugin with a real ``ApprovalService``.
+
+    Returns:
+        ``(older_id, newer_id)``.
+    """
+    older = await create_pending(plugin, "task-older", reason="older")
+    await asyncio.sleep(0.01)
+    newer = await create_pending(plugin, "task-newer", reason="newer")
+    return older, newer
+
+
+@pytest.mark.asyncio
+async def test_quick_approve_targets_the_latest_pending(plugin_factory) -> None:
+    """``/dsh approve`` without an id allows only the newest pending row.
+
+    Args:
+        plugin_factory: Initialised plugin factory.
+    """
+    plugin = await plugin_factory(HostContext())
+    older, newer = await make_two_pending(plugin)
+
+    output = "\n".join(await collect(plugin.dsh_approve(Event())))
+
+    assert newer in output
+    assert "已批准" in output
+    assert "cross_end_submit" in output
+    assert "task-newer" in output
+    assert "测试审批：newer" in output
+    row = await plugin._store.get_approval(newer)
+    assert row is not None
+    assert row["state"] == "decided"
+    assert row["outcome"] == "allowed-once"
+    assert row["actor_kind"] == ACTOR_HUMAN
+    assert row["actor"] == f"astrbot_admin:{ADMIN}"
+    assert row["channel"] == "im"
+    assert row["decided_reason"] == "source_command=approve_latest"
+    untouched = await plugin._store.get_approval(older)
+    assert untouched is not None
+    assert untouched["state"] == "pending"
+    assert untouched["actor"] is None
+
+
+@pytest.mark.asyncio
+async def test_quick_reject_targets_the_latest_pending(plugin_factory) -> None:
+    """``/dsh reject`` without an id rejects only the newest pending row.
+
+    Args:
+        plugin_factory: Initialised plugin factory.
+    """
+    plugin = await plugin_factory(HostContext())
+    older, newer = await make_two_pending(plugin)
+
+    output = "\n".join(await collect(plugin.dsh_reject(Event())))
+
+    assert newer in output
+    assert older not in output
+    assert "已拒绝" in output
+    row = await plugin._store.get_approval(newer)
+    assert row is not None
+    assert row["state"] == "decided"
+    assert row["outcome"] == "rejected"
+    assert row["actor_kind"] == ACTOR_HUMAN
+    assert row["channel"] == "im"
+    assert row["decided_reason"] == "source_command=reject_latest"
+    untouched = await plugin._store.get_approval(older)
+    assert untouched is not None and untouched["state"] == "pending"
+
+
+@pytest.mark.asyncio
+async def test_quick_decision_empty_queue_is_explicit_and_calls_nothing(
+    plugin_factory,
+) -> None:
+    """An empty queue answers clearly for both commands and never decides.
+
+    Args:
+        plugin_factory: Initialised plugin factory.
+    """
+    plugin = await plugin_factory(HostContext())
+    calls: list[tuple] = []
+    original = plugin._approvals.human_decide
+
+    async def counted(*args, **kwargs):
+        calls.append((args, kwargs))
+        return await original(*args, **kwargs)
+
+    plugin._approvals.human_decide = counted
+    try:
+        approve = "\n".join(await collect(plugin.dsh_approve(Event())))
+        reject = "\n".join(await collect(plugin.dsh_reject(Event())))
+    finally:
+        plugin._approvals.human_decide = original
+
+    assert "没有待审批" in approve
+    assert "没有待审批" in reject
+    assert calls == []
+
+
+@pytest.mark.asyncio
+async def test_quick_approval_non_admin_has_zero_side_effects(plugin_factory) -> None:
+    """A non-admin cannot quick-decide or list pending and changes nothing.
+
+    Args:
+        plugin_factory: Initialised plugin factory.
+    """
+    plugin = await plugin_factory(HostContext())
+    older, newer = await make_two_pending(plugin)
+
+    approve = "\n".join(await collect(plugin.dsh_approve(Event(sender="intruder"))))
+    reject = "\n".join(await collect(plugin.dsh_reject(Event(sender="intruder"))))
+    listing = "\n".join(await collect(plugin.dsh_pending(Event(sender="intruder"))))
+
+    for output in (approve, reject, listing):
+        assert "仅管理员" in output
+        assert older not in output
+        assert newer not in output
+    for approval_id in (older, newer):
+        row = await plugin._store.get_approval(approval_id)
+        assert row is not None
+        assert row["state"] == "pending"
+        assert row["actor"] is None
+
+
+@pytest.mark.asyncio
+async def test_pending_lists_real_rows_newest_first(plugin_factory) -> None:
+    """``/dsh pending`` mirrors the real pending queue, newest first.
+
+    Args:
+        plugin_factory: Initialised plugin factory.
+    """
+    plugin = await plugin_factory(HostContext())
+    created = []
+    for index in range(3):
+        created.append(
+            await create_pending(plugin, f"task-{index}", reason=f"r{index}")
+        )
+        await asyncio.sleep(0.01)
+
+    output = "\n".join(await collect(plugin.dsh_pending(Event())))
+
+    pending = await plugin._store.list_approvals(state="pending", limit=200)
+    listed = [row["approval_id"] for row in pending]
+    assert listed == list(reversed(created))
+    for approval_id in listed:
+        assert approval_id in output
+    assert output.index(created[-1]) < output.index(created[0])
+    for index in range(3):
+        assert f"测试审批：r{index}" in output
+
+
+@pytest.mark.asyncio
+async def test_pending_limit_and_default_cap(plugin_factory) -> None:
+    """``/dsh pending [n]`` honours ``n`` and the hard cap of 20.
+
+    Args:
+        plugin_factory: Initialised plugin factory.
+    """
+    plugin = await plugin_factory(HostContext())
+    created = []
+    for index in range(21):
+        created.append(
+            await create_pending(plugin, f"task-{index}", reason=f"r{index}")
+        )
+
+    explicit = "\n".join(await collect(plugin.dsh_pending(Event(), 2)))
+    shown = [approval_id for approval_id in created if approval_id in explicit]
+    assert len(shown) == 2
+    assert created[-1] in shown and created[-2] in shown
+    assert created[0] not in shown
+
+    default = "\n".join(await collect(plugin.dsh_pending(Event())))
+    assert sum(1 for approval_id in created if approval_id in default) == 5
+
+    capped = "\n".join(await collect(plugin.dsh_pending(Event(), 100)))
+    assert sum(1 for approval_id in created if approval_id in capped) == 20
+    assert created[0] not in capped
+
+
+@pytest.mark.asyncio
+async def test_pending_empty_queue_is_explicit(plugin_factory) -> None:
+    """``/dsh pending`` reports an empty queue instead of failing.
+
+    Args:
+        plugin_factory: Initialised plugin factory.
+    """
+    plugin = await plugin_factory(HostContext())
+    output = "\n".join(await collect(plugin.dsh_pending(Event())))
+    assert "没有待审批" in output
+
+
+@pytest.mark.asyncio
+async def test_explicit_id_and_batch_all_keep_their_meaning(plugin_factory) -> None:
+    """The pre-existing ``<id>`` and ``all`` paths still decide exactly as before.
+
+    Args:
+        plugin_factory: Initialised plugin factory.
+    """
+    plugin = await plugin_factory(HostContext())
+    older, newer = await make_two_pending(plugin)
+
+    explicit = "\n".join(await collect(plugin.dsh_approve(Event(), older)))
+    assert older in explicit
+    oldest_row = await plugin._store.get_approval(older)
+    assert oldest_row is not None
+    assert oldest_row["outcome"] == "allowed-once"
+    assert oldest_row["decided_reason"] is None
+    assert (await plugin._store.get_approval(newer))["state"] == "pending"
+
+    extra = await create_pending(plugin, "task-extra", reason="extra")
+    batch = "\n".join(await collect(plugin.dsh_approve(Event(), "all", "5")))
+    assert newer in batch and extra in batch
+    for approval_id in (newer, extra):
+        row = await plugin._store.get_approval(approval_id)
+        assert row is not None
+        assert row["outcome"] == "allowed-once"
+        assert row["actor_kind"] == ACTOR_HUMAN
+        assert row["decided_reason"] == "source_command=approve_all"
+
+
+@pytest.mark.asyncio
+async def test_approval_notification_advertises_copyable_quick_commands(
+    plugin_factory,
+) -> None:
+    """The IM approval text ends with a copy-paste hint, keeping its trigger rules.
+
+    Args:
+        plugin_factory: Initialised plugin factory.
+    """
+    context = HostContext()
+    plugin = await plugin_factory(
+        context, approval_notify_umo=UMO, approval_notify_channels=["im"]
+    )
+
+    await plugin._on_human_notify(
+        {
+            "approval_id": "a-quick",
+            "approval_type": "cross_end_submit",
+            "tool": "astr_agent_run",
+            "channels": ["im"],
+        }
+    )
+    text = context.sent_messages[0][1].chain[0].text
+    assert "a-quick" in text
+    assert QUICK_HINT in text
+
+    # A timeout announcement is not actionable, so it must not advertise approve.
+    await plugin._on_human_notify(
+        {
+            "approval_id": "a-timeout",
+            "approval_type": "cross_end_submit",
+            "timed_out": True,
+            "channels": ["im"],
+        }
+    )
+    timeout_text = context.sent_messages[1][1].chain[0].text
+    assert QUICK_HINT not in timeout_text
+
+    # Business decisions are answered through the decision path, not /dsh approve.
+    await plugin._on_human_notify(
+        {
+            "approval_id": "d-1",
+            "approval_type": "business_decision",
+            "tool": "decision",
+            "channels": ["im"],
+        }
+    )
+    decision_text = context.sent_messages[2][1].chain[0].text
+    assert QUICK_HINT not in decision_text
+
+    # ``approval_notify_umo`` still decides the target; no landing fallback appears.
+    assert all(umo == UMO for umo, _chain in context.sent_messages)
+
+
+@pytest.mark.asyncio
+async def test_wake_text_needs_approval_advertises_quick_commands(
+    plugin_factory,
+) -> None:
+    """The wake text for an approval event carries the same copyable hint.
+
+    Args:
+        plugin_factory: Initialised plugin factory.
+    """
+    plugin = await plugin_factory(HostContext())
+    task = await make_task(plugin._store, "task-wake")
+    text = plugin._wake_text(task, "needs_approval")
+    assert QUICK_HINT in text

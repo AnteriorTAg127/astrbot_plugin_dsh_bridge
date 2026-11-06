@@ -3,6 +3,34 @@
 本文件面向使用者，记录发布版本的可见变更。
 开发过程记录（每次改动、测试与调试）在 `开发/changelog.md`，不随仓库发布。
 
+## [0.3.1] - 2026-11-06
+
+人工审批的 **UX 优化**：把一次人工批准/拒绝压缩成 IM 里的一句话，**不改协议、不改审批语义**。`metadata.yaml` 仍为 `v0.3.0`（本轮不升版本）。**自动批准未实现**：v0.4 安全审查已确认，在现有协议下无法安全实现真正的自动批准——`native_tool` 请求在 B 侧没有任何 UMO 数据源（B 仓库 `umo` 零命中，请求的 `task_id` / `root_task_id` 均为 null），而 A 本地 `cross_end_submit` 的 `approval_ref.actor_kind` 被 B 三处写死要求 `human`；改协议等于无界开口子并影响全部审批证据链。因此本版只做**人工审批的一键 UX**，没有 `policy` / `auto_review_*` / `accept_policy_approvals` 路径。
+
+### 新增
+
+- **免 id 一键审批**：`/dsh approve` / `/dsh reject` 不带 id 时作用于**当前最新的一条 pending 审批**（`Store.list_approvals` 按 `created_at DESC` 排序，同时间戳用 `rowid DESC` 稳定次序；已过期但尚未被超时循环清扫的行跳过）。输出包含 `approval_id`、类型（`approval_type`/`tool`）、来源任务 id 与摘要（`display_reason.zh/en`，回退到 `reason`，最长 80 字符）。仍走既有 `ApprovalService.human_decide`：`actor_kind="human"`、`actor=astrbot_admin:<id>`、`channel="im"`、一次有效；`decided_reason` 记录 `source_command=approve_latest` / `source_command=reject_latest`，便于来源审计。空队列返回「当前没有待审批项，未执行任何操作。」且不调用决定逻辑。
+- **`/dsh pending [n]`**：列出待审批项（默认 5，最多 20），每项输出完整 `approval_id`、类型、任务 id 与摘要，可直接复制到 `/dsh approve <审批号>`；空队列明确提示。仅管理员可用。
+- **通知文案提示**：审批通知（走 `approval_notify_umo` 的 IM 文案）与 `needs_approval` 唤醒文案末尾追加 `回复 /dsh approve 即可批准最新一项，或 /dsh approve <id> 指定。`。超时通知与业务决策通知不带该提示；通知触发条件与 `approval_notify_umo` 优先级不变。
+
+### 兼容与迁移
+
+- 既有 `/dsh approve <id>`（含唯一前缀）与 `/dsh approve all [n]` / `/dsh reject <id> [理由]` / `/dsh reject all [n]` 行为不变；单条、免 id 与批量共用同一人工决定路径。
+- 无协议、无数据库结构变更；`schema_version` 仍为 `3`。`approvals` 查询只增加 `rowid` 次序，用于同时间戳下的确定性，不改变任何列或语义。
+- 管理员判定继续使用 v0.3 加固后的 `_is_admin`；`/dsh approve` / `/dsh reject` / `/dsh pending` 对非管理员零副作用。
+
+### 诚实边界
+
+- **免 id 只自动选择目标，不自动决定**：操作仍由管理员在 IM 中发出，仍逐条记录 `actor_kind="human"`；这不是 auto-review，也没有后台自动批准。
+- **「最新」以本地库时间为准**：`created_at` 是 A 侧墙钟；同秒同时间戳的稳定次序靠 `rowid`。若管理员同时发起多条审批，免 id 命中的是 A 侧记录的最新一条，而非对端事件顺序。
+- **只处理可执行的 pending**：`expires_at` 已过的行不会作为免 id 目标；`/dsh pending` 也不列出它们，但仍会由既有超时循环按原逻辑置为 `rejected`。
+- **仍是 IM 明文命令**：命令入口和输出都经过现有 IM 通道；本轮不新增鉴权机制，管理员身份仍由 `admins_id` 与平台一致性决定。
+
+### 测试
+
+- 在既有 `tests/test_v03_admin_and_landing.py` 新增 10 个用例（真实 `Store` / `ApprovalService` + 临时 SQLite，仅 AstrBot 宿主为 double）：免 id 批准最新（其余不变、含 id/类型/任务/摘要、`actor_kind=human`/`channel=im`/来源命令）、免 id 拒绝最新、空队列明确提示且对 `human_decide` 零调用、非管理员对 approve/reject/pending 零副作用、`/dsh pending` 与真实队列一致且 5/20 上限生效、空队列提示、既有 `<id>` 与 `all` 回归、IM 通知与唤醒文案提示（超时/业务决策不带提示、`approval_notify_umo` 优先级不变）。
+- 先红：**9 failed, 1 passed**（2.34s，新用例）；实现后 新用例 **10 passed**，`tests/test_v03_admin_and_landing.py` **34 passed**（3.89s），A 全量单测（不含 `tests/integration`）**520 passed（37.16s）**。原始先红/后绿输出见 `开发/v0.3/test/A-quick-approval.md`。
+
 ## [0.3.0] - 2026-11-06
 
 通知落地、批量人工审批与管理员判定加固（A 端 R1/R2/R2b）。`LABEL`、密码学套件、AAD、封帧布局、错误码词表与金标准向量均未改变；数据库不加表、不加列，只在既有 `meta` KV 增加两个非 `schema_version` 键。**auto-review 未实现**（v0.4 待设计）；本版提供的是**批量人工审批**，不是自动批准。

@@ -1360,6 +1360,9 @@ class Store:
     ) -> list[dict]:
         """List approvals, newest first.
 
+        ``created_at`` is a wall-clock float; ``rowid`` breaks same-timestamp ties
+        so "newest" is deterministic for the quick-approval commands.
+
         Args:
             state: Optional ``pending``/``decided`` filter.
             limit: Page size.
@@ -1370,10 +1373,13 @@ class Store:
         db = self._conn()
         limit = max(1, min(200, int(limit)))
         if state:
-            sql = "SELECT * FROM approvals WHERE state = ? ORDER BY created_at DESC LIMIT ?"
+            sql = (
+                "SELECT * FROM approvals WHERE state = ? "
+                "ORDER BY created_at DESC, rowid DESC LIMIT ?"
+            )
             params: list[Any] = [state, limit]
         else:
-            sql = "SELECT * FROM approvals ORDER BY created_at DESC LIMIT ?"
+            sql = "SELECT * FROM approvals ORDER BY created_at DESC, rowid DESC LIMIT ?"
             params = [limit]
         async with db.execute(sql, params) as cursor:
             rows = await cursor.fetchall()

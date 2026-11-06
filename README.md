@@ -12,7 +12,7 @@
 > 协议主本 `开发/v0.1/protocol.md` 属于**内部开发工作记录，不随公开仓库/交付包发布**；
 > 公开可复核的金标准向量是本仓库 [`tests/fixtures/protocol_vectors_v1.json`](tests/fixtures/protocol_vectors_v1.json)。
 
-**版本状态**：插件 `v0.3.0`（`metadata.yaml` 的 `astrbot_version` 为 `>=4.16,<5`）。对端 DSH 侧的版本与验收以其独立仓库为准；本仓库本轮只验证 A 端。本地测试环境为 **AstrBot 4.29.3 / Python 3.12.16**；用户环境报告为 **4.29.4**，本轮未在 4.29.4 上真实运行验收，只有本机 4.29.3 的宿主契约测试与用户截图所示契约一致，不能据此宣称 4.29.4 已通过。**当前快照（2026-11-06）**：A 全量单测（不含 `tests/integration`）**510 passed（37.28s）**，其中 v0.3 新增 24 个用例；真实 AstrBot 宿主内的整机联调、真实 OpenAPI/SSE 流、真实 IM 平台、真实 LLM 多模态判定与 TLS 均未验证（BLOCKED-ENV）。部署前请先读文末「测试现状」与「已知限制与未验证项」。用户命令统一写成**单行 PowerShell**；`tests/integration/` 中的跨传输 harness 仅支持 POSIX（依赖 `/proc` 与进程组信号），Windows 原生环境不宣称跑通含 integration 的全量，请改用 WSL 执行（命令仍为单行 PowerShell，见「开发」）。
+**版本状态**：插件 `v0.3.0`（`metadata.yaml` 的 `astrbot_version` 为 `>=4.16,<5`）；本轮工作树包含**未发布的 v0.3.1 人工审批 UX 优化**，未升 `metadata.yaml` 版本。对端 DSH 侧的版本与验收以其独立仓库为准；本仓库本轮只验证 A 端。本地测试环境为 **AstrBot 4.29.3 / Python 3.12.16**；用户环境报告为 **4.29.4**，本轮未在 4.29.4 上真实运行验收，只有本机 4.29.3 的宿主契约测试与用户截图所示契约一致，不能据此宣称 4.29.4 已通过。**当前快照（2026-11-06）**：A 全量单测（不含 `tests/integration`）**520 passed（37.16s）**，其中 v0.3 新增 24 个用例、未发布的 v0.3.1 UX 新增 10 个用例；真实 AstrBot 宿主内的整机联调、真实 OpenAPI/SSE 流、真实 IM 平台、真实 LLM 多模态判定与 TLS 均未验证（BLOCKED-ENV）。部署前请先读文末「测试现状」与「已知限制与未验证项」。用户命令统一写成**单行 PowerShell**；`tests/integration/` 中的跨传输 harness 仅支持 POSIX（依赖 `/proc` 与进程组信号），Windows 原生环境不宣称跑通含 integration 的全量，请改用 WSL 执行（命令仍为单行 PowerShell，见「开发」）。
 
 ## 功能
 
@@ -21,6 +21,7 @@
 - **持久化与幂等**：任务、事件、审批、授权、唤醒计数存 SQLite（`data/plugin_data/astrbot_plugin_dsh_bridge/bridge.db`），重启不丢。
 - **人工审批与业务决策**：三类审批（业务决策 / 跨端提交 / DSH 原生工具）统一进 A 侧待审批队列；**A 侧队列内**同一审批首个答复生效。DSH 原生审批采用 B 侧 claim-or-hand-back，本地 UI 与远端人类并不会同时对同一请求作答——这与原始需求「双方都能答、先答者胜」**不等价**，该竞争语义仍未实现（见「已知限制与未验证项」）。
 - **批量人工审批（v0.3）**：`/dsh approve all [n]` / `/dsh reject all [n]` 对当前 pending 列表一次人工确认、逐条生效，默认上限 20、显式上限 50。每条仍走既有 `human_decide` 路径（`actor_kind="human"`），逐条输出 `approval_id` 与结果；单条失败不影响其它条。每条决定的 `decided_reason` 以固定前缀记录来源命令：`source_command=approve_all` / `source_command=reject_all`（附人工理由时为 `source_command=...; reason=...`），便于按来源审计；不新增协议字段。**这是批量人工审批，不是 auto-review**：本版没有任何自动批准路径，auto-review 移到 v0.4 重新设计。
+- **一键人工审批 UX（v0.3.1，未发布）**：`/dsh approve` / `/dsh reject` 不带 id 时作用于**当前最新的一条 pending 审批**（按创建时间倒序；`rowid` 作为同时间戳的稳定次序），输出 `approval_id`、类型、任务 id 与摘要；`/dsh pending [n]` 列出待审批项（默认 5，最多 20，完整审批号可直接复制）。审批通知与 `needs_approval` 唤醒文案末尾追加一行 `/dsh approve` 可复制提示。所有决定仍走既有 `human_decide`（`actor_kind="human"`、`channel="im"`、管理员 `actor`），既有的 `/dsh approve <id>` 与 `all` 行为不变；空队列明确提示且不调用决定逻辑。**这是把人工审批压成一句命令的 UX 优化，不是自动批准**：v0.4 安全审查已确认在现有协议下无法安全实现自动批准（`native_tool` 请求在 B 侧没有 UMO 数据源，且 `approval_ref.actor_kind` 被 B 要求为 `human`），故本版不实现 auto-review。
 - **通知落地会话（v0.3 R1）**：管理员在目标会话执行 `/dsh bind`，桥接把该 `unified_msg_origin` 存入既有 `meta` KV（重启保留）；入站任务通知按「任务 `payload.umo` → 全局落地绑定」解析，两者都没有时**不发消息**，只写 `reason=no_umo` 日志并在任务本地标 `error.details.degraded="no_umo"`。任务进入终态 `succeeded` 时清除此前遗留的该降级标记（只清 `degraded` 键，错误码语义不变）；若成功后的通知本身仍降级，会重新如实标注。`/dsh status` 与后台状态页都会提示「未绑定落地会话」。绑定只影响通知落点，不改任务执行会话与授权面；`approval_notify_umo` 仍是显式配置优先，落地绑定不会自动接管。
 - **管理员判定加固（v0.3 R2b）**：`_is_admin` 不再单独相信 `event.role`，要求 `sender_id` 非空、平台 id 非空且与事件 UMO 平台一致、并命中 `admins_id`。`admins_id` 支持 `"<platform_id>:<sender_id>"` 平台限定写法；裸 ID 仍按 AstrBot 的全局语义，但同样要求平台信息自洽。
 - **任务错误码宽容（v0.3）**：`task.event.error` 按对端原样落库与展示，不按 §15 `BridgeError` 词表做白名单校验；对端任务级码（例如 `agent_turn_failed`、`agent_output_missing`）不会导致状态误判，`/dsh tasks` 与后台页遇到未知码也不会报错。
@@ -156,10 +157,15 @@ A 侧已经把「本端监听」与「对端地址」拆成两组字段（`conn_
 | `/dsh tasks [n]` | 管理员 | 最近任务（`→` 本端发起 / `←` 对端发起；输出完整 `task_id`，可直接回传查询） |
 | `/dsh sessions` | 管理员 | 会话授权与 Agent 创建配额（会话 ID 为完整 UUID） |
 | `/dsh sessions check [fix]` | 管理员 | 与对端 `session.list` 对账（不比对实例）；`fix` 抬版到 `max(本地, 对端)+1` 后严格重推再复查（需活动连接） |
+| `/dsh pending [n]` | 管理员 | 列出待审批项（默认 5，最多 20；输出完整 `approval_id` 与摘要，可直接复制） |
+| `/dsh approve` | 管理员 | 批准**最新一条** pending（按创建时间倒序；仍逐条人工、`actor_kind="human"`） |
 | `/dsh approve <审批号>` | 管理员 | 批准**一次**（审批号可用前几位） |
 | `/dsh approve all [n]` | 管理员 | 批量批准当前 pending（默认 20，`n` 最大 50；逐条人工、逐条报告） |
+| `/dsh reject` | 管理员 | 拒绝**最新一条** pending（按创建时间倒序；仍逐条人工、`actor_kind="human"`） |
 | `/dsh reject <审批号> [理由]` | 管理员 | 拒绝 |
 | `/dsh reject all [n]` | 管理员 | 批量拒绝当前 pending（默认 20，`n` 最大 50；逐条人工、逐条报告） |
+
+审批通知（IM）与 `needs_approval` 唤醒文案末尾会追加：`回复 /dsh approve 即可批准最新一项，或 /dsh approve <id> 指定。` 该提示只影响文案，不改变通知触发条件，也不改变 `approval_notify_umo` 优先级；超时通知与业务决策通知不带该提示。**免 id 只自动选择目标，不自动决定**：空队列时明确提示「没有待审批项」且不调用决定逻辑；非管理员没有任何副作用。
 
 ### LLM 工具
 
@@ -234,7 +240,7 @@ AstrBot 插件详情页 → 打开「bridge」视图。包含四块：
 
 - **同秒重建的实例时间戳**：`instance_started_at` 目前是**秒级**。若 A 的数据库在**同一秒内**被重建，新旧实例的该值会相等，对端按 §9.7.1 规则 4 会**拒收**新实例（哪怕 version 更高）——这是故障安全方向（不同步而非回滚授权）。运维侧处理：确认后清理对端 `authz/current` 记录，再让 A 推送；根因修复（改毫秒/单调计数）列入 v0.4 待办（v0.3 未做）。
 - **对端授权缓存被清空会重新打开升级路径**：B 的规则 0（缓存无身份 → 接受首份完整身份）在**本地 `authz/current` 记录被删除或损坏**后会再次生效，一条旧实例快照即可被接受并把授权表回滚。这不是本版本的新增攻击面（通道已认证、帧层 seq 防重放），但需要运维保证该记录不被手工清理；加固（持久化「曾记录身份」标记）列入 v0.4 待办（v0.3 未做）。
-- **auto-review 未实现（v0.3）**：本版没有 `policy` / `auto_review_admin_dm` / `accept_policy_approvals` 之类代码或配置；`/dsh approve all` 只是把多次人工点击合成一次命令，每条仍记录 `actor_kind="human"`，不会因来源是管理员而跳过审批。auto-review 需先解决「入站请求没有来源会话」与协议 §12.6/§16.4 约束，移到 v0.4 重新设计。
+- **auto-review 未实现（v0.3 / v0.4 审查结论）**：本版没有 `policy` / `auto_review_admin_dm` / `accept_policy_approvals` 之类代码或配置；`/dsh approve all` 与未发布的 `/dsh approve`（免 id）都只是把人工决定压缩成一条命令，每条仍记录 `actor_kind="human"`，不会因来源是管理员而跳过审批。v0.4 安全审查结论：`native_tool` 请求在 B 侧没有 UMO 数据源（请求的 `task_id` / `root_task_id` 均为 null），而 A 本地 `cross_end_submit` 的 `approval_ref.actor_kind` 被 B 三处写死要求 `human`；改协议等于无界开口并影响全部审批证据链。**因此当前协议下无法安全实现真正的自动批准，本版不做 auto-review**，只做「一句话人工审批」的 UX 优化。
 - **落地绑定不会消除 IM 注入副作用（v0.3）**：`/dsh bind` 后通知以真实 IM 消息进入目标会话，AstrBot 会把它当普通消息分发给所有插件与指令处理器；第三方插件若假设事件一定有 `event.bot` 等 IM 属性仍可能出错。绑定只解决「消息发到哪里」，不改变宿主分发语义。
 - **管理员平台限定需要显式写法（v0.3）**：裸 `admins_id` 条目是 AstrBot 的全局语义，无法区分不同平台的同号 id；需要跨平台隔离时写 `"<platform_id>:<sender_id>"`（平台 id 来自 `event.get_platform_id()`）。`event.role` 不再单独作为管理员证据；空 `sender_id`、空平台、UMO 平台与事件平台不一致均判否。
 - **未绑定即不发 IM（v0.3）**：没有 `payload.umo` 且未 `/dsh bind` 时，任务状态通知只写 `reason=no_umo` 日志与本地 `error.details.degraded`，不会自动回退到 `approval_notify_umo` 或其他会话；这是有意的 fail-closed，避免 web-only 部署被悄悄改成发 IM。
@@ -252,7 +258,7 @@ AstrBot 插件详情页 → 打开「bridge」视图。包含四块：
 - **授权体检不能证明 DSH 会话真实存在（v0.2）**：`/dsh sessions check` 只反映对端授权表与活动状态，且 `session.list` 应答没有实例字段，因此**不比对实例**；`state=cold` 只表示对端没有活动 agent，不代表 DSH 里没有该会话。`fix` 在创建锁内把本地版本抬到 `max(本地, 对端)+1` 后重推权威快照（对端 `session.create` 也会抬高它自己的版本，简单 `+1` 仍可能被拒），推送失败会如实报错；`fix` 不删除/新增授权、不自动撤销历史幽灵授权，差异消失只说明两端授权表一致，不说明会话可执行。
 - **实例字段与跨端契约（v0.2）**：A 在 `authz_meta` 持久化 `instance_id`（UUIDv4）与 `instance_started_at`（Unix 秒，首次建库时间），同一数据库重启两者都不变，换库文件两者都变化；`session.authz` 始终同时携带两者。`tests/fixtures/session_authz_v02.json` 是两端共享的规范化快照，A 侧用例断言线格式的键集合与类型与它一致，避免再次出现「一端不发字段、另一端永远拒收」。`instance_started_at` 依赖 A 主机时钟单调：重建时若系统时钟显著回拨，新实例会被对端判为更旧而拒收，这是故障安全方向。
 - **R1 换实例规则需要两端同时升级（v0.2）**：`instance_id` / `instance_started_at` 是可选加法；旧版对端缺少/忽略这两个字段时仍按严格版本单调处理，A 重建数据库后的推送可能被判 `stale_authz`。A 侧验证了字段生成、持久化、快照透出与跨端 fixture 契约，但未做真实跨端运行验收。
-- **类型与验收**：没有独立的类型检查门禁；历史跨端快照里的 19 PASS / 7 `BLOCKED-IMPL` 与更早的 295/335 条数字均已过时，只作存档。**v0.3 当前 A 侧快照（2026-11-06）**为 **510 passed**（不含 `tests/integration`，37.28s，含 v0.3 新增 24 个用例）；B 侧与跨端回环/跨传输/独立密码学结果以其仓库和 Lead 的串行验收为准，本仓库本轮未重跑。真实宿主稳定验收仍 `BLOCKED-ENV`。
+- **类型与验收**：没有独立的类型检查门禁；历史跨端快照里的 19 PASS / 7 `BLOCKED-IMPL` 与更早的 295/335 条数字均已过时，只作存档。**A 侧当前快照（2026-11-06）**为 **520 passed**（不含 `tests/integration`，37.16s，含 v0.3 新增 24 个用例与未发布 v0.3.1 UX 新增 10 个用例）；B 侧与跨端回环/跨传输/独立密码学结果以其仓库和 Lead 的串行验收为准，本仓库本轮未重跑。真实宿主稳定验收仍 `BLOCKED-ENV`。
 - **降级回退**：`TransportManager.carrier_degraded()` → `_switch_to_fallback()` 已真实接线，回环用例有通过记录；但真实跨机 Webhook 探测失败后的回退仍未在真实网络验证，不能据此宣称生产可用。
 - 双方都不可达（双 NAT、无公网入口、无隧道）时无法连通，插件只给出可读诊断，不无限重试。
 - 首版仅支持图片，不做一般文件/音频/视频传输。
@@ -316,6 +322,7 @@ Set-Location <你的 AstrBot 目录>; uv run pytest data\plugins\astrbot_plugin_
 
 ### 测试现状（历史快照，不等于当前验收）
 
+- **2026-11-06 v0.3.1（未发布）一键人工审批 UX**：`tests/test_v03_admin_and_landing.py` 新增 10 个用例（先红 **9 failed / 1 passed**，后绿 **10 passed**）；A 全量单测（不含 `tests/integration`）**520 passed（37.16s）**。覆盖免 id 批准/拒绝最新 pending、空队列零调用、非管理员零副作用、`/dsh pending` 与真实队列一致及 5/20 上限、既有 `<id>` 与 `all` 回归、通知文案提示（超时/业务决策不带提示）。原始先红/后绿输出与风险见 `开发/v0.3/test/A-quick-approval.md`。
 - **2026-11-06 v0.3 A 侧快照**：A 全量单测（不含 `tests/integration`）**510 passed（37.28s）**；其中 v0.3 新增 `tests/test_v03_admin_and_landing.py` **24 passed**（首轮先红 14 failed / 6 passed；final-gate 小修先红 2 failed / 22 passed）。覆盖落地 UMO、批量人工审批、管理员判定加固、来源命令审计、对端未知任务错误码与成功后退订降级标记；原始先红/后绿输出见 `开发/v0.3/test/A-umo-batch-admin.md`。
 - **2026-11-03 快照**：A 全量单测 470 passed（32.32s，含 22 个本机 peer-first 创建用例）；B 全量单测 377 passed / 0 failed（35.03s，2026-11-02 快照）；A+B 真实 socket 业务回环 24 passed（254.83s）；跨传输 26 passed（165.26s）；独立密码学校验 36/36 passed；B `tsc -p tsconfig.json --noEmit` exit 0。命令与分项见 `开发/changelog.md`、`开发/v0.1/test/peer-session-creation-fix.md`、`开发/v0.1/test/llm-tool-host-contract-hotfix.md`、`开发/v0.1/test/session-id-integrity-hotfix.md`、`开发/v0.1/test/business-roundtrip-results.md`、`开发/v0.1/test/approval-lookup-results.md`。
 - **更早的数字已作废**：A 360 / B 348 / business 22（17:35）、295/335、19 PASS / 7 `BLOCKED-IMPL` 等快照均已被取代，只作存档。
